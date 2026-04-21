@@ -432,7 +432,7 @@ do_gen_traefik() {
     local out="${TRAEFIK_DYNAMIC_PATH}/${OUTPUT_FILE}"
     mkdir -p "$TRAEFIK_DYNAMIC_PATH"
     if [ ! -f "${CA_PATH}/ca.crt" ]; then
-        warn "CA не найден — Traefik конфиг не обновлён."; return 1
+        warn "CA not found — Traefik config was not updated."; return 1
     fi
     rebuild_bundle
     local bundle; bundle=$(bundle_file)
@@ -502,7 +502,7 @@ do_gen_traefik() {
         fi
     } > "$out"
     chmod 644 "$out"; touch "$out"
-    ok "Traefik конфиг: ${out}"
+    ok "Traefik config: ${out}"
     local active_count=0
     local all_names; all_names=$(db_list_names)
     if [ -n "$all_names" ]; then
@@ -512,11 +512,11 @@ do_gen_traefik() {
             [ "$r" != "1" ] && echo "$uid"
         done <<< "$all_names" | wc -l)
     fi
-    info "Bundle: ${active_count} промежуточных CA"
+    info "Bundle: ${active_count} intermediate CAs"
 }
 
 # =============================================================================
-#  UI  (упрощённый)
+#  UI  (simplified)
 # =============================================================================
 header() {
     clear
@@ -552,7 +552,7 @@ ask_secret() {
     echo "$result"
 }
 
-# FIX: убрана вложенная подоболочка и лишний \n перед read
+# FIX: removed nested subshell and extra \n before read
 ask_yn() {
     local prompt="$1" result
     printf "  %s [y/N]: " "$prompt" >/dev/tty
@@ -562,12 +562,12 @@ ask_yn() {
 
 pause() {
     echo ""
-    printf "  ${DIM}Enter — продолжить...${RESET}" >/dev/tty
+    printf "  ${DIM}Enter — continue...${RESET}" >/dev/tty
     read -r _ </dev/tty
 }
 
 menu_choice() {
-    printf "\n  Выбор: " >/dev/tty
+    printf "\n  Choice: " >/dev/tty
     read -r MENU_CHOICE </dev/tty
     echo "$MENU_CHOICE"
 }
@@ -581,11 +581,11 @@ check_deps() {
     command -v python3 >/dev/null 2>&1 || need_python=1
     [ "$need_openssl" -eq 0 ] && [ "$need_python" -eq 0 ] && return 0
     header
-    section "Проверка зависимостей"
-    [ "$need_openssl" -eq 1 ] && warn "openssl не найден"
-    [ "$need_python"  -eq 1 ] && warn "python3 не найден"
+    section "Dependency check"
+    [ "$need_openssl" -eq 1 ] && warn "openssl not found"
+    [ "$need_python"  -eq 1 ] && warn "python3 not found"
     echo ""
-    ask_yn "Установить автоматически?" || { err "openssl и python3 обязательны."; exit 1; }
+    ask_yn "Install automatically?" || { err "openssl and python3 are required."; exit 1; }
     if command -v apt-get >/dev/null 2>&1; then
         sudo apt-get update -qq
         [ "$need_openssl" -eq 1 ] && sudo apt-get install -y openssl
@@ -600,10 +600,10 @@ check_deps() {
         [ "$need_openssl" -eq 1 ] && brew install openssl
         [ "$need_python"  -eq 1 ] && brew install python3
     else
-        err "Не удалось определить пакетный менеджер. Установите вручную."
+        err "Could not detect a package manager. Install manually."
         exit 1
     fi
-    ok "Готово."
+    ok "Done."
 }
 
 # =============================================================================
@@ -612,23 +612,23 @@ check_deps() {
 cert_status() {
     local uid="$1"
     local revoked; revoked=$(db_read "$uid" "revoked")
-    [ "$revoked" = "1" ] && echo "ОТОЗВАН" && return
+    [ "$revoked" = "1" ] && echo "REVOKED" && return
     local expires; expires=$(db_read "$uid" "expires")
     local today exp diff
     today=$(date +%s 2>/dev/null || echo 0)
     exp=$(date -d "$expires" +%s 2>/dev/null || date -j -f "%Y-%m-%d" "$expires" +%s 2>/dev/null || echo 9999999999)
     diff=$(( (exp - today) / 86400 ))
-    if   [ "$diff" -lt 0  ]; then echo "ИСТЁК"
-    elif [ "$diff" -le 30 ]; then echo "СКОРО (${diff}д)"
-    else                          echo "АКТИВЕН"
+    if   [ "$diff" -lt 0  ]; then echo "EXPIRED"
+    elif [ "$diff" -le 30 ]; then echo "EXPIRING (${diff}d)"
+    else                          echo "ACTIVE"
     fi
 }
 
 cert_status_color() {
     case "$1" in
-        АКТИВЕН)  echo "$GREEN" ;;
-        ОТОЗВАН)  echo "$RED" ;;
-        ИСТЁК)    echo "$RED" ;;
+        ACTIVE)  echo "$GREEN" ;;
+        REVOKED)  echo "$RED" ;;
+        EXPIRED)    echo "$RED" ;;
         *)        echo "$YELLOW" ;;
     esac
 }
@@ -636,7 +636,7 @@ cert_status_color() {
 print_cert_table() {
     local names="$1"
     [ -z "$names" ] && return
-    printf "  ${BOLD}%-4s %-20s %-14s %-11s %-11s %-16s %-20s${RESET}\n" "#" "Имя" "Сервис" "Создан" "Истекает" "Статус" "Заметка"
+    printf "  ${BOLD}%-4s %-20s %-14s %-11s %-11s %-16s %-20s${RESET}\n" "#" "Name" "Service" "Created" "Expires" "Status" "Note"
     hr
     local i=1
     while IFS= read -r uid; do
@@ -656,38 +656,38 @@ print_cert_table() {
 #  MENU: CREATE CA
 # =============================================================================
 do_create_ca() {
-    header; section "Создание корневого CA"
+    header; section "Create root CA"
     if ca_exists; then
-        warn "CA уже существует: ${CA_PATH}/ca.crt"
-        echo ""; warn "ВНИМАНИЕ: пересоздание CA аннулирует ВСЕ выпущенные сертификаты!"; echo ""
-        ask_yn "Пересоздать CA?" || return
+        warn "CA already exists: ${CA_PATH}/ca.crt"
+        echo ""; warn "WARNING: recreating CA invalidates ALL issued certificates!"; echo ""
+        ask_yn "Recreate CA?" || return
     fi
     mkdir -p "$CA_PATH" "${CA_PATH}/intermediates"; chmod 700 "$CA_PATH"
     local cn days
-    cn=$(ask "Имя CA (CN)" "mTLS-Root-CA")
-    days=$(ask "Срок действия CA (дней)" "3650")
+    cn=$(ask "Name CA (CN)" "mTLS-Root-CA")
+    days=$(ask "CA validity period (days)" "3650")
     echo ""
-    info "Генерирую ключ CA (4096 bit)..."
+    info "Generating CA key (4096 bit)..."
     openssl genrsa -out "${CA_PATH}/ca.key" 4096 2>/dev/null; chmod 600 "${CA_PATH}/ca.key"
-    info "Генерирую сертификат CA..."
+    info "Generating CA certificate..."
     openssl req -new -x509 -days "$days" -key "${CA_PATH}/ca.key" -out "${CA_PATH}/ca.crt" \
         -subj "/CN=${cn}/O=mTLS-Manager/C=US" 2>/dev/null
-    info "Инициализирую CA database..."
+    info "Initializing CA database..."
     rm -f "${CA_PATH}/index.txt" "${CA_PATH}/index.txt.attr" "${CA_PATH}/serial"
     ca_db_init; rebuild_crl
     db_write "__ca__" "cn" "$cn"
     db_write "__ca__" "days" "$days"
     db_write "__ca__" "created" "$(date '+%Y-%m-%d %H:%M:%S')"
-    echo ""; ok "CA создан!"
-    echo -e "    ${DIM}Ключ : ${CA_PATH}/ca.key${RESET}"
-    echo -e "    ${DIM}Серт : ${CA_PATH}/ca.crt${RESET}"
+    echo ""; ok "CA created!"
+    echo -e "    ${DIM}Key : ${CA_PATH}/ca.key${RESET}"
+    echo -e "    ${DIM}Cert : ${CA_PATH}/ca.crt${RESET}"
     do_gen_traefik; pause
 }
 
 ensure_ca() {
     if ! ca_exists; then
-        warn "Корневой CA не найден."; echo ""
-        ask_yn "Создать CA сейчас?" || { err "CA обязателен."; pause; return 1; }
+        warn "Root CA not found."; echo ""
+        ask_yn "Create CA now?" || { err "CA is required."; pause; return 1; }
         do_create_ca
     fi
     return 0
@@ -697,11 +697,11 @@ ensure_ca() {
 #  MENU: CREATE CERT
 # =============================================================================
 menu_cert_create() {
-    header; section "Создание нового сертификата"
+    header; section "Create new certificate"
     ensure_ca || return
     local svc_names; svc_names=$(svc_list_names)
-    if [ -z "$svc_names" ]; then warn "Нет сервисов. Сначала добавьте сервис (пункт 4)."; pause; return; fi
-    echo -e "  ${BOLD}Доступные сервисы:${RESET}"; echo ""
+    if [ -z "$svc_names" ]; then warn "No services. Add a service first (option 4)."; pause; return; fi
+    echo -e "  ${BOLD}Available services:${RESET}"; echo ""
     local i=1 svc_arr=()
     while IFS= read -r s; do
         [ -z "$s" ] && continue
@@ -710,48 +710,48 @@ menu_cert_create() {
         echo -e "    ${CYAN}${i})${RESET}  $s${label}"
         svc_arr+=("$s"); i=$((i + 1))
     done <<< "$svc_names"; echo ""
-    local svc_idx; svc_idx=$(ask "Выберите сервис (номер)" "1")
-    local service="${svc_arr[$((svc_idx - 1))]}"; if [ -z "$service" ]; then err "Неверный номер."; pause; return; fi
+    local svc_idx; svc_idx=$(ask "Select service (number)" "1")
+    local service="${svc_arr[$((svc_idx - 1))]}"; if [ -z "$service" ]; then err "Invalid number."; pause; return; fi
     echo ""
-    local cert_name; cert_name=$(ask "Имя сертификата (латиница, без пробелов)" "")
+    local cert_name; cert_name=$(ask "Certificate name (latin, no spaces)" "")
     cert_name="${cert_name// /-}"
-    if [ -z "$cert_name" ]; then err "Имя не может быть пустым."; pause; return; fi
+    if [ -z "$cert_name" ]; then err "Name cannot be empty."; pause; return; fi
     local uid="${service}__${cert_name}"
     local existing; existing=$(db_read "$uid" "created")
     local ex_rev; ex_rev=$(db_read "$uid" "revoked")
     if [ -n "$existing" ] && [ "$ex_rev" != "1" ]; then
-        warn "Сертификат '${cert_name}' для '${service}' уже существует."
-        ask_yn "Пересоздать?" || { pause; return; }
+        warn "Certificate '${cert_name}' for '${service}' already exists."
+        ask_yn "Recreate?" || { pause; return; }
         db_write "$uid" "revoked" "1"; rebuild_bundle
     fi
     local days note
-    days=$(ask "Срок действия (дней)" "$CERT_DAYS")
-    note=$(ask "Заметка (для кого / чего)" "")
-    echo ""; echo -e "  ${BOLD}Пароль для .p12:${RESET}"
+    days=$(ask "Validity period (days)" "$CERT_DAYS")
+    note=$(ask "Note (who/what for)" "")
+    echo ""; echo -e "  ${BOLD}Password for .p12:${RESET}"
     local pass1 pass2
-    pass1=$(ask_secret "Введите пароль")
-    pass2=$(ask_secret "Повторите пароль")
-    if [ "$pass1" != "$pass2" ]; then err "Пароли не совпадают."; pause; return; fi
+    pass1=$(ask_secret "Enter password")
+    pass2=$(ask_secret "Repeat password")
+    if [ "$pass1" != "$pass2" ]; then err "Passwords do not match."; pause; return; fi
     local cert_dir="${CLIENTS_PATH}/${service}/${cert_name}"
     mkdir -p "$cert_dir"; chmod 700 "$cert_dir"
     echo ""
-    info "Генерирую ключ (2048 bit)..."
+    info "Generating key (2048 bit)..."
     openssl genrsa -out "${cert_dir}/client.key" 2048 2>/dev/null; chmod 600 "${cert_dir}/client.key"
-    info "Создаю CSR..."
+    info "Creating CSR..."
     openssl req -new -key "${cert_dir}/client.key" -out "${cert_dir}/client.csr" \
         -subj "/CN=${cert_name}/O=${service}/C=US" 2>/dev/null
-    info "Создаю промежуточный CA для ${cert_name}..."
+    info "Creating intermediate CA for ${cert_name}..."
     create_int_ca "$uid" "$cert_name" "$service"
-    info "Подписываю клиентский сертификат..."
+    info "Signing client certificate..."
     sign_client_with_int_ca "$uid" "$cert_dir" "$days"
     if [ ! -f "${cert_dir}/client.crt" ]; then
-        err "Ошибка подписания!"
+        err "Signing error!"
         rm -rf "$cert_dir"
         [ -d "$(int_ca_dir "$uid")" ] && rm -rf "$(int_ca_dir "$uid")"
         pause; return
     fi
     rebuild_crl
-    info "Создаю .p12..."
+    info "Creating .p12..."
     if [ -n "$pass1" ]; then
         openssl pkcs12 -export -out "${cert_dir}/client.p12" \
             -inkey "${cert_dir}/client.key" -in "${cert_dir}/client.crt" \
@@ -775,54 +775,54 @@ menu_cert_create() {
     db_write "$uid" "revoked" "0"
     db_write "$uid" "path" "$cert_dir"
     db_write "$uid" "serial" "$serial"
-    info "Обновляю bundle и Traefik конфиг..."
+    info "Updating bundle and Traefik config..."
     do_gen_traefik >/dev/null 2>&1
     local svc_mode; svc_mode=$(svc_get "$service" "mode")
     if [ "$svc_mode" = "patch" ]; then
         local pfile; pfile=$(svc_get "$service" "patch_file")
         local prouter; prouter=$(svc_get "$service" "patch_router")
-        info "Применяю patch к ${pfile} (роутер: ${prouter})..."
+        info "Applying patch to ${pfile} (router: ${prouter})..."
         local result; result=$(patch_apply "$service" "$pfile" "$prouter")
         case "$result" in
-            patched)         ok "Patch применён." ;;
-            already_patched) info "Patch уже применён." ;;
-            not_found)       warn "Роутер '${prouter}' не найден в файле." ;;
+            patched)         ok "Patch applied." ;;
+            already_patched) info "Patch already applied." ;;
+            not_found)       warn "Router '${prouter}' not found in file." ;;
         esac
     fi
-    echo ""; ok "Сертификат создан!"; hr
+    echo ""; ok "Certificate created!"; hr
     echo -e "  ${DIM}${cert_dir}/client.p12${RESET}"
-    echo -e "  Серийный №  : $serial"
-    echo -e "  Срок до     : $expiry"
-    echo -e "  Заметка     : $note_val"
-    [ -n "$pass1" ] && echo -e "  Пароль .p12 : ${GREEN}установлен${RESET}" || echo -e "  Пароль .p12 : ${YELLOW}не установлен${RESET}"
+    echo -e "  Serial #  : $serial"
+    echo -e "  Valid until     : $expiry"
+    echo -e "  Note     : $note_val"
+    [ -n "$pass1" ] && echo -e "  P12 password : ${GREEN}set${RESET}" || echo -e "  P12 password : ${YELLOW}not set${RESET}"
     pause
 }
 
 # =============================================================================
-#  MENU: REVOKE + DELETE  (ИСПРАВЛЕНО)
+#  MENU: REVOKE + DELETE  (FIXED)
 # =============================================================================
 menu_cert_delete() {
-    header; section "Отзыв и удаление сертификата"
+    header; section "Revoke and delete certificate"
     local names; names=$(db_list_names)
-    if [ -z "$names" ]; then warn "Нет сертификатов."; pause; return; fi
+    if [ -z "$names" ]; then warn "No certificates."; pause; return; fi
     print_cert_table "$names"; echo ""
 
-    # Строим массив uid заранее
+    # Build uid array in advance
     local cert_arr=()
     while IFS= read -r uid; do
         [ -z "$uid" ] && continue
         cert_arr+=("$uid")
     done <<< "$names"
 
-    echo -e "  ${BOLD}0)${RESET}  Назад"; echo ""
-    local choice; choice=$(ask "Выберите номер сертификата" "")
+    echo -e "  ${BOLD}0)${RESET}  Back"; echo ""
+    local choice; choice=$(ask "Select certificate number" "")
     [ "$choice" = "0" ] || [ -z "$choice" ] && return
 
     local idx=$(( choice - 1 ))
     local uid="${cert_arr[$idx]}"
-    if [ -z "$uid" ]; then err "Неверный номер."; pause; return; fi
+    if [ -z "$uid" ]; then err "Invalid number."; pause; return; fi
 
-    # Читаем все данные ДО любых изменений в БД
+    # Read all data BEFORE any DB changes
     local cname csvc cpath crevoked cint_dir
     cname=$(db_read "$uid" "name")
     csvc=$(db_read "$uid" "service")
@@ -831,34 +831,34 @@ menu_cert_delete() {
     cint_dir=$(db_read "$uid" "int_ca_path")
 
     echo ""
-    echo -e "  ${BOLD}Выбран:${RESET} ${cname:-<unknown>}  ${DIM}(сервис: ${csvc:-<unknown>})${RESET}"
+    echo -e "  ${BOLD}Selected:${RESET} ${cname:-<unknown>}  ${DIM}(service: ${csvc:-<unknown>})${RESET}"
     echo ""
 
     if [ "$crevoked" != "1" ]; then
-        # ── ШАГ 1: только отзыв ──────────────────────────────────────────────
-        warn "Сейчас сертификат будет ОТОЗВАН (доступ заблокируется)."
-        warn "Зайдите сюда ещё раз чтобы УДАЛИТЬ файлы с диска."
+        # ── STEP 1: revocation only ──────────────────────────────────────────────
+        warn "The certificate will now be REVOKED (access will be blocked)."
+        warn "Come back here again to DELETE files from disk."
         echo ""
-        ask_yn "Отозвать сертификат '${cname}'?" || { pause; return; }
+        ask_yn "Revoke certificate '${cname}'?" || { pause; return; }
         db_write "$uid" "revoked" "1"
-        info "Обновляю bundle..."
+        info "Updating bundle..."
         do_gen_traefik >/dev/null 2>&1
-        ok "Сертификат отозван. Зайдите сюда снова чтобы удалить файлы."
+        ok "Certificate revoked. Come back again to delete files."
     else
-        # ── ШАГ 2: удаление файлов (уже отозван) ────────────────────────────
-        warn "Сертификат уже отозван. Сейчас будут удалены файлы с диска."
+        # ── STEP 2: delete files (already revoked) ────────────────────────────
+        warn "Certificate is already revoked. Files will now be deleted from disk."
         echo ""
-        ask_yn "Удалить файлы '${cname}' с диска? (необратимо)" || { ok "Файлы оставлены."; pause; return; }
+        ask_yn "Delete files '${cname}' from disk? (irreversible)" || { ok "Files kept."; pause; return; }
 
-        # 1. Клиентские файлы
+        # 1. Client files
         if [ -n "$cpath" ] && [ -d "$cpath" ]; then
             rm -rf "$cpath"
-            ok "Файлы сертификата удалены: ${cpath}"
+            ok "Certificate files deleted: ${cpath}"
         else
-            warn "Папка сертификата не найдена, пропускаем."
+            warn "Certificate folder not found, skipping."
         fi
 
-        # 2. Промежуточный CA
+        # 2. Intermediate CA
         local int_dir_to_remove=""
         if [ -n "$cint_dir" ] && [ -d "$cint_dir" ]; then
             int_dir_to_remove="$cint_dir"
@@ -869,14 +869,14 @@ menu_cert_delete() {
 
         if [ -n "$int_dir_to_remove" ]; then
             rm -rf "$int_dir_to_remove"
-            ok "Промежуточный CA удалён: ${int_dir_to_remove}"
+            ok "Intermediate CA removed: ${int_dir_to_remove}"
         else
-            info "Промежуточный CA не найден (уже удалён или не создавался)."
+            info "Intermediate CA not found (already removed or not created)."
         fi
 
-        # 3. Запись из БД — последней
+        # 3. DB record — last
         db_delete "$uid"
-        ok "Запись удалена из базы."
+        ok "Record removed from database."
     fi
 
     pause
@@ -886,20 +886,20 @@ menu_cert_delete() {
 #  MENU: LIST CERTS
 # =============================================================================
 menu_cert_list() {
-    header; section "Список сертификатов"
+    header; section "Certificate list"
     local names; names=$(db_list_names)
-    if [ -z "$names" ]; then warn "Нет сертификатов."; pause; return; fi
+    if [ -z "$names" ]; then warn "No certificates."; pause; return; fi
     print_cert_table "$names"
     local total; total=$(db_count)
-    echo ""; echo -e "  ${DIM}Всего: $total${RESET}"; echo ""
+    echo ""; echo -e "  ${DIM}Total: $total${RESET}"; echo ""
     if ca_exists; then
         local ca_cn ca_created
         ca_cn=$(db_read "__ca__" "cn"); ca_created=$(db_read "__ca__" "created")
-        echo -e "  ${DIM}CA     : $ca_cn  (создан: $ca_created)${RESET}"
+        echo -e "  ${DIM}CA     : $ca_cn  (created: $ca_created)${RESET}"
         local bundle_path; bundle_path=$(bundle_file)
         if [ -f "$bundle_path" ]; then
             local bundle_count; bundle_count=$(grep -c "BEGIN CERTIFICATE" "$bundle_path" 2>/dev/null || echo "?")
-            echo -e "  ${DIM}Bundle : ${bundle_path}  ${GREEN}✔${RESET}  ${DIM}(${bundle_count} промежуточных CA)${RESET}"
+            echo -e "  ${DIM}Bundle : ${bundle_path}  ${GREEN}✔${RESET}  ${DIM}(${bundle_count} intermediate CAs)${RESET}"
         fi
     fi
     pause
@@ -910,10 +910,10 @@ menu_cert_list() {
 # =============================================================================
 menu_services() {
     while true; do
-        header; section "Управление сервисами"
+        header; section "Service management"
         local svc_names; svc_names=$(svc_list_names)
         if [ -n "$svc_names" ]; then
-            printf "  ${BOLD}%-4s %-18s %-8s %-26s %-20s${RESET}\n" "#" "Имя" "Режим" "Домен/Файл" "Роутер/Target"; hr
+            printf "  ${BOLD}%-4s %-18s %-8s %-26s %-20s${RESET}\n" "#" "Name" "Mode" "Domain/File" "Router/Target"; hr
             local i=1
             while IFS= read -r s; do
                 [ -z "$s" ] && continue
@@ -928,38 +928,38 @@ menu_services() {
                 i=$((i + 1))
             done <<< "$svc_names"; hr; echo ""
         else
-            warn "Нет добавленных сервисов."; echo ""
+            warn "No services added."; echo ""
         fi
-        echo -e "  ${BOLD}1)${RESET}  Добавить сервис [new]    — новый домен"
-        echo -e "  ${BOLD}2)${RESET}  Добавить сервис [patch]  — существующий роутер"
-        echo -e "  ${BOLD}3)${RESET}  Удалить сервис"
-        echo -e "  ${BOLD}4)${RESET}  Обновить Traefik конфиг"
-        echo -e "  ${BOLD}0)${RESET}  Назад"
+        echo -e "  ${BOLD}1)${RESET}  Add service [new]    — new domain"
+        echo -e "  ${BOLD}2)${RESET}  Add service [patch]  — existing router"
+        echo -e "  ${BOLD}3)${RESET}  Delete service"
+        echo -e "  ${BOLD}4)${RESET}  Update Traefik config"
+        echo -e "  ${BOLD}0)${RESET}  Back"
         local c; c=$(menu_choice)
         case "$c" in
             1)
                 echo ""
                 local sname sdomain starget
-                sname=$(ask "Имя сервиса" ""); sname="${sname// /-}"
-                sdomain=$(ask "Домен (напр: myapp.example.com)" "")
-                starget=$(ask "Target URL  (напр: http://localhost:3000)" "")
+                sname=$(ask "Service name" ""); sname="${sname// /-}"
+                sdomain=$(ask "Domain (e.g.: myapp.example.com)" "")
+                starget=$(ask "Target URL  (e.g.: http://localhost:3000)" "")
                 if [ -z "$sname" ] || [ -z "$sdomain" ] || [ -z "$starget" ]; then
-                    err "Все поля обязательны."
+                    err "All fields are required."
                 else
                     svc_add "$sname" "$sdomain" "$starget" "new" "" ""
-                    do_gen_traefik; ok "Сервис '${sname}' добавлен."
+                    do_gen_traefik; ok "Service '${sname}' added."
                 fi
                 pause ;;
             2)
                 echo ""
-                echo -e "  ${DIM}Файлы в ${TRAEFIK_DYNAMIC_PATH}/:${RESET}"
+                echo -e "  ${DIM}Files in ${TRAEFIK_DYNAMIC_PATH}/:${RESET}"
                 ls "${TRAEFIK_DYNAMIC_PATH}"/*.yml "${TRAEFIK_DYNAMIC_PATH}"/*.yaml 2>/dev/null \
                     | while read -r f; do echo -e "    ${CYAN}${f##*/}${RESET}"; done
                 echo ""
                 local sname spf spr
-                sname=$(ask "Имя сервиса (будет mtls-<имя>)" ""); sname="${sname// /-}"
-                spf=$(ask "Файл конфига (полный путь)" "${TRAEFIK_DYNAMIC_PATH}/dokploy.yml")
-                echo ""; echo -e "  ${DIM}Роутеры в файле:${RESET}"
+                sname=$(ask "Service name (will be mtls-<name>)" ""); sname="${sname// /-}"
+                spf=$(ask "Config file (full path)" "${TRAEFIK_DYNAMIC_PATH}/dokploy.yml")
+                echo ""; echo -e "  ${DIM}Routers in file:${RESET}"
                 python3 - "$spf" << 'PYEOF' 2>/dev/null
 import sys
 try:
@@ -974,34 +974,34 @@ try:
 except: pass
 PYEOF
                 echo ""
-                spr=$(ask "Имя роутера (точно как в файле)" "")
+                spr=$(ask "Router name (exactly as in file)" "")
                 if [ -z "$sname" ] || [ -z "$spf" ] || [ -z "$spr" ]; then
-                    err "Все поля обязательны."
+                    err "All fields are required."
                 elif [ ! -f "$spf" ]; then
-                    err "Файл не найден: $spf"
+                    err "File not found: $spf"
                 else
                     svc_add "$sname" "" "" "patch" "$spf" "$spr"
                     do_gen_traefik
-                    ok "Сервис '${sname}' добавлен [patch]. Создайте сертификат — patch применится автоматически."
+                    ok "Service '${sname}' added [patch]. Create certificate — patch will apply automatically."
                 fi
                 pause ;;
             3)
-                [ -z "$svc_names" ] && { warn "Нет сервисов."; pause; continue; }
+                [ -z "$svc_names" ] && { warn "No services."; pause; continue; }
                 echo ""
                 local s_arr=()
                 while IFS= read -r s; do [ -z "$s" ] && continue; s_arr+=("$s"); done <<< "$svc_names"
-                local sc; sc=$(ask "Номер сервиса для удаления" "")
+                local sc; sc=$(ask "Service number to delete" "")
                 [ -z "$sc" ] && { pause; continue; }
                 local sdel="${s_arr[$((sc - 1))]}"
-                if [ -n "$sdel" ] && ask_yn "Удалить сервис '$sdel'?"; then
+                if [ -n "$sdel" ] && ask_yn "Delete service '$sdel'?"; then
                     local dm; dm=$(svc_get "$sdel" "mode")
                     if [ "$dm" = "patch" ]; then
                         local dpf; dpf=$(svc_get "$sdel" "patch_file")
                         local dpr; dpr=$(svc_get "$sdel" "patch_router")
-                        info "Снимаю patch из ${dpf}..."
-                        patch_remove "$sdel" "$dpf" "$dpr"; ok "Patch снят."
+                        info "Removing patch from ${dpf}..."
+                        patch_remove "$sdel" "$dpf" "$dpr"; ok "Patch removed."
                     fi
-                    svc_delete "$sdel"; do_gen_traefik; ok "Удалено."
+                    svc_delete "$sdel"; do_gen_traefik; ok "Deleted."
                 fi
                 pause ;;
             4) do_gen_traefik; pause ;;
@@ -1015,29 +1015,29 @@ PYEOF
 # =============================================================================
 menu_settings() {
     while true; do
-        header; section "Настройка путей"
-        echo -e "  ${BOLD}1)${RESET}  Dynamic-конфиги Traefik\n     ${CYAN}${TRAEFIK_DYNAMIC_PATH}${RESET}\n"
-        echo -e "  ${BOLD}2)${RESET}  Папка CA\n     ${CYAN}${CA_PATH}${RESET}\n"
-        echo -e "  ${BOLD}3)${RESET}  Папка клиентских сертификатов\n     ${CYAN}${CLIENTS_PATH}${RESET}\n"
-        echo -e "  ${BOLD}4)${RESET}  Имя файла конфига\n     ${CYAN}${OUTPUT_FILE}${RESET}\n"
-        echo -e "  ${BOLD}5)${RESET}  Срок по умолчанию (дней)\n     ${CYAN}${CERT_DAYS}${RESET}\n"
+        header; section "Path settings"
+        echo -e "  ${BOLD}1)${RESET}  Traefik dynamic configs\n     ${CYAN}${TRAEFIK_DYNAMIC_PATH}${RESET}\n"
+        echo -e "  ${BOLD}2)${RESET}  CA folder\n     ${CYAN}${CA_PATH}${RESET}\n"
+        echo -e "  ${BOLD}3)${RESET}  Client certificates folder\n     ${CYAN}${CLIENTS_PATH}${RESET}\n"
+        echo -e "  ${BOLD}4)${RESET}  Config filename\n     ${CYAN}${OUTPUT_FILE}${RESET}\n"
+        echo -e "  ${BOLD}5)${RESET}  Default validity (days)\n     ${CYAN}${CERT_DAYS}${RESET}\n"
         hr
-        echo -e "  ${DIM}Пресеты:${RESET}"
+        echo -e "  ${DIM}Presets:${RESET}"
         echo -e "  ${BOLD}p1)${RESET} Dokploy   /etc/dokploy/traefik/dynamic"
         echo -e "  ${BOLD}p2)${RESET} Traefik   /etc/traefik/dynamic"
-        echo -e "  ${BOLD}p3)${RESET} Локально  ./traefik-local"
+        echo -e "  ${BOLD}p3)${RESET} Local  ./traefik-local"
         hr; echo ""
-        echo -e "  ${BOLD}0)${RESET}  Назад"
+        echo -e "  ${BOLD}0)${RESET}  Back"
         local c; c=$(menu_choice)
         case "$c" in
-            1) TRAEFIK_DYNAMIC_PATH=$(ask "Новый путь" "$TRAEFIK_DYNAMIC_PATH"); save_config; ok "Сохранено."; pause ;;
-            2) CA_PATH=$(ask "Новый путь" "$CA_PATH"); save_config; ok "Сохранено."; pause ;;
-            3) CLIENTS_PATH=$(ask "Новый путь" "$CLIENTS_PATH"); save_config; ok "Сохранено."; pause ;;
-            4) OUTPUT_FILE=$(ask "Новое имя файла" "$OUTPUT_FILE"); save_config; ok "Сохранено."; pause ;;
-            5) CERT_DAYS=$(ask "Дней" "$CERT_DAYS"); save_config; ok "Сохранено."; pause ;;
-            p1) TRAEFIK_DYNAMIC_PATH="/etc/dokploy/traefik/dynamic"; CA_PATH="/etc/dokploy/traefik/dynamic/certificates/ca"; CLIENTS_PATH="/etc/dokploy/traefik/dynamic/certificates/clients"; OUTPUT_FILE="mtls-manager.yml"; save_config; ok "Пресет Dokploy применён."; pause ;;
-            p2) TRAEFIK_DYNAMIC_PATH="/etc/traefik/dynamic"; CA_PATH="/etc/traefik/certs/ca"; CLIENTS_PATH="/etc/traefik/certs/clients"; OUTPUT_FILE="mtls-manager.yml"; save_config; ok "Пресет Traefik применён."; pause ;;
-            p3) TRAEFIK_DYNAMIC_PATH="$(pwd)/traefik-local/dynamic"; CA_PATH="$(pwd)/traefik-local/certs/ca"; CLIENTS_PATH="$(pwd)/traefik-local/certs/clients"; OUTPUT_FILE="mtls-manager.yml"; save_config; ok "Пресет локальный применён."; pause ;;
+            1) TRAEFIK_DYNAMIC_PATH=$(ask "New path" "$TRAEFIK_DYNAMIC_PATH"); save_config; ok "Saved."; pause ;;
+            2) CA_PATH=$(ask "New path" "$CA_PATH"); save_config; ok "Saved."; pause ;;
+            3) CLIENTS_PATH=$(ask "New path" "$CLIENTS_PATH"); save_config; ok "Saved."; pause ;;
+            4) OUTPUT_FILE=$(ask "New filename" "$OUTPUT_FILE"); save_config; ok "Saved."; pause ;;
+            5) CERT_DAYS=$(ask "Days" "$CERT_DAYS"); save_config; ok "Saved."; pause ;;
+            p1) TRAEFIK_DYNAMIC_PATH="/etc/dokploy/traefik/dynamic"; CA_PATH="/etc/dokploy/traefik/dynamic/certificates/ca"; CLIENTS_PATH="/etc/dokploy/traefik/dynamic/certificates/clients"; OUTPUT_FILE="mtls-manager.yml"; save_config; ok "Dokploy preset applied."; pause ;;
+            p2) TRAEFIK_DYNAMIC_PATH="/etc/traefik/dynamic"; CA_PATH="/etc/traefik/certs/ca"; CLIENTS_PATH="/etc/traefik/certs/clients"; OUTPUT_FILE="mtls-manager.yml"; save_config; ok "Traefik preset applied."; pause ;;
+            p3) TRAEFIK_DYNAMIC_PATH="$(pwd)/traefik-local/dynamic"; CA_PATH="$(pwd)/traefik-local/certs/ca"; CLIENTS_PATH="$(pwd)/traefik-local/certs/clients"; OUTPUT_FILE="mtls-manager.yml"; save_config; ok "Local preset applied."; pause ;;
             0) return ;;
         esac
     done
@@ -1050,23 +1050,23 @@ main_menu() {
     while true; do
         header
         local ca_status
-        ca_exists && ca_status="${GREEN}CA ✔${RESET}" || ca_status="${RED}CA ✖ не создан${RESET}"
+        ca_exists && ca_status="${GREEN}CA ✔${RESET}" || ca_status="${RED}CA ✖ not created${RESET}"
         local svc_count cert_count
         svc_count=$(svc_count); cert_count=$(db_count)
         echo -e "  ${DIM}${TRAEFIK_DYNAMIC_PATH}${RESET}"
-        echo -e "  ${ca_status}   ${DIM}сервисов: ${svc_count}   сертификатов: ${cert_count}${RESET}"
+        echo -e "  ${ca_status}   ${DIM}services: ${svc_count}   certificates: ${cert_count}${RESET}"
         hr; echo ""
-        echo -e "  ${BOLD}1)${RESET}  Создать сертификат"
-        echo -e "  ${BOLD}2)${RESET}  Список сертификатов"
-        echo -e "  ${BOLD}3)${RESET}  Отозвать / удалить сертификат"
+        echo -e "  ${BOLD}1)${RESET}  Create certificate"
+        echo -e "  ${BOLD}2)${RESET}  Certificate list"
+        echo -e "  ${BOLD}3)${RESET}  Revoke / delete certificate"
         echo ""
-        echo -e "  ${BOLD}4)${RESET}  Управление сервисами"
+        echo -e "  ${BOLD}4)${RESET}  Service management"
         echo ""
-        echo -e "  ${BOLD}5)${RESET}  Создать / пересоздать CA"
-        echo -e "  ${BOLD}6)${RESET}  Настройка путей"
-        echo -e "  ${BOLD}7)${RESET}  Обновить Traefik конфиг"
+        echo -e "  ${BOLD}5)${RESET}  Create / recreate CA"
+        echo -e "  ${BOLD}6)${RESET}  Path settings"
+        echo -e "  ${BOLD}7)${RESET}  Update Traefik config"
         echo ""
-        echo -e "  ${BOLD}0)${RESET}  ${DIM}Выход${RESET}"
+        echo -e "  ${BOLD}0)${RESET}  ${DIM}Exit${RESET}"
         local c; c=$(menu_choice)
         case "$c" in
             1) menu_cert_create ;;
