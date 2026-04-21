@@ -5,6 +5,8 @@
 > Репозиторий: [opensophy-projects](https://github.com/opensophy-projects)
 <img width="802" height="521" alt="image" src="https://github.com/user-attachments/assets/771c81a4-ac71-4002-bd67-1cfaf9d0dae7" />
 
+**Скрипт проверен на Ubuntu, платформа Dokploy - в качестве управления докер контейнерами итп.**
+
 ---
 
 ## Оглавление
