@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  mtls)
+    exec "$ROOT_DIR/commands/mtls/main.sh" "$@"
+    ;;
+  help|-h|--help)
+    cat <<'HELP'
+os — OpenSophy CLI
+
+Usage:
+  os <command>
+
+Commands:
+  mtls      Open mTLS manager TUI
+  help      Show this help
+HELP
+    ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    exit 1
+    ;;
+esac

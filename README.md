@@ -1,20 +1,36 @@
-# mtls.sh — mTLS Certificate Manager
+# opensophy-cli (os)
 
-<div align="center">
+`os` is a modular CLI for OpenSophy tools.
 
-[![English Guide](https://img.shields.io/badge/README-English-2ea44f?style=for-the-badge)](<Script%20and%20guide%20in%20English/README.md>)
-[![Русский гайд](https://img.shields.io/badge/README-Русский-1f6feb?style=for-the-badge)](<Скрипт%20и%20гайд%20на%20Русском/README.md>)
+## Install
 
-[![English Script](https://img.shields.io/badge/Script-English-2ea44f?style=for-the-badge)](<Script%20and%20guide%20in%20English/mtls.sh>)
-[![Скрипт на русском](https://img.shields.io/badge/Script-Русский-1f6feb?style=for-the-badge)](<Скрипт%20и%20гайд%20на%20Русском/mtls.sh>)
+```bash
+curl -fsSL https://raw.githubusercontent.com/opensophy-projects/opensophy-cli/main/install.sh | bash
+```
 
-</div>
+## Commands
 
----
+- `os mtls` — interactive mTLS manager TUI with Docker labels support.
 
-## Quick language switch
+## Architecture
 
-- 🇬🇧 **English**: [Open README](<Script and guide in English/README.md>)
-- 🇷🇺 **Русский**: [Открыть README](<Скрипт и гайд на Русском/README.md>)
+```text
+bin/os                 - command dispatcher
+lib/core.sh            - shared UI and helper functions
+commands/mtls/main.sh  - mTLS command entrypoint and main menu
+commands/mtls/config.sh- config load/save
+commands/mtls/db.sh    - metadata storage and service CRUD
+commands/mtls/docker.sh- Docker labels discovery and sync
+install.sh             - bootstrap installer
+```
 
-> Main README is now a navigation page with buttons to the English and Russian versions.
+## Docker labels
+
+Supported labels:
+
+- `mtls.enable=true`
+- `mtls.service=<service_name>`
+- `mtls.domain=<service_domain>`
+- `mtls.router=<router_name>`
+
+In TUI: `os mtls` → `🐳 Docker` → `Sync labels -> services`.
