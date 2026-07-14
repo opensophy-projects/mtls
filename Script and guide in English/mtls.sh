@@ -36,6 +36,7 @@ WEBHOOK_URL=""
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_CHAT_ID=""
 NOTIFY_EXPIRY_DAYS=14
+USERS_FILE="${MTLS_USERS_FILE:-${HOME}/.mtls-manager.users}"
 
 # Non-interactive flag (set by CLI subcommands)
 MTLS_NONINTERACTIVE=0
@@ -178,6 +179,100 @@ db_init() {
     [ -f "$DB_FILE" ]       || { echo '{}' > "$DB_FILE";  chmod 600 "$DB_FILE"; }
     [ -f "$SERVICES_FILE" ] || { echo '[]' > "$SERVICES_FILE"; chmod 600 "$SERVICES_FILE"; }
     [ -f "$AUDIT_FILE" ]    || { touch "$AUDIT_FILE"; chmod 600 "$AUDIT_FILE"; }
+    [ -f "$USERS_FILE" ]    || { echo '[]' > "$USERS_FILE"; chmod 600 "$USERS_FILE"; }
+}
+
+# =============================================================================
+#  ACCESS CONTROL — root always bypasses; non-root users must be in the list
+# =============================================================================
+acl_check() {
+    # Root always allowed
+    [ "$(id -u)" -eq 0 ] && return 0
+
+    local current_user; current_user="${SUDO_USER:-${USER:-$(whoami)}}"
+
+    # If no allowed-users list exists yet, only root can use the script
+    [ -f "$USERS_FILE" ] || { return 1; }
+
+    python3 - "$USERS_FILE" "$current_user" << 'PYEOF' 2>/dev/null
+import sys, json
+with open(sys.argv[1]) as f:
+    users = json.load(f)
+sys.exit(0 if sys.argv[2] in users else 1)
+PYEOF
+}
+
+acl_list() {
+    [ -f "$USERS_FILE" ] || return 0
+    python3 - "$USERS_FILE" << 'PYEOF' 2>/dev/null
+import sys, json
+with open(sys.argv[1]) as f:
+    users = json.load(f)
+for u in users:
+    print(u)
+PYEOF
+}
+
+acl_add() {
+    local username="$1"
+    local tmp; tmp=$(mktemp "${USERS_FILE}.XXXXXX")
+    python3 - "$USERS_FILE" "$username" "$tmp" << 'PYEOF'
+import sys, json
+with open(sys.argv[1]) as f:
+    users = json.load(f)
+if sys.argv[2] not in users:
+    users.append(sys.argv[2])
+with open(sys.argv[3], 'w') as f:
+    json.dump(users, f, indent=2)
+PYEOF
+    mv "$tmp" "$USERS_FILE"
+    chmod 600 "$USERS_FILE"
+}
+
+acl_remove() {
+    local username="$1"
+    local tmp; tmp=$(mktemp "${USERS_FILE}.XXXXXX")
+    python3 - "$USERS_FILE" "$username" "$tmp" << 'PYEOF'
+import sys, json
+with open(sys.argv[1]) as f:
+    users = json.load(f)
+users = [u for u in users if u != sys.argv[2]]
+with open(sys.argv[3], 'w') as f:
+    json.dump(users, f, indent=2)
+PYEOF
+    mv "$tmp" "$USERS_FILE"
+    chmod 600 "$USERS_FILE"
+}
+
+# List real human users on the system (UID >= 1000, has a home dir, shell is not /nologin)
+list_system_users() {
+    while IFS=':' read -r login _ uid _ _ home shell; do
+        [ "$uid" -ge 1000 ] 2>/dev/null || continue
+        [[ "$shell" == *nologin* ]] && continue
+        [[ "$shell" == */false ]] && continue
+        echo "${login}"
+    done < /etc/passwd
+}
+
+# Check if CA path is writable by the current user; if not, show guidance
+check_path_access() {
+    local test_path="$CA_PATH"
+    # Root always passes
+    [ "$(id -u)" -eq 0 ] && return 0
+
+    # Check if we can create the CA path
+    if ! mkdir -p "$test_path" 2>/dev/null; then
+        echo ""
+        echo -e "  ${RED}✖${RESET}  No write access to: ${test_path}"
+        echo ""
+        echo -e "  ${YELLOW}Options:${RESET}"
+        echo -e "    1. Run with sudo:  ${CYAN}sudo mtls.sh${RESET}"
+        echo -e "    2. Change paths in Settings → use a local preset (p3)"
+        echo -e "    3. Ask root to grant access:  ${CYAN}sudo mtls.sh users add \$USER${RESET}"
+        echo ""
+        return 1
+    fi
+    return 0
 }
 
 db_write() {
@@ -1019,7 +1114,11 @@ core_create_ca() {
         warn "Recreating CA invalidates ALL issued certificates!"
         ask_yn "Recreate CA?" || return 1
     fi
-    mkdir -p "$CA_PATH" "${CA_PATH}/intermediates"; chmod 700 "$CA_PATH"
+
+    # Check if we can write to the CA path
+    if ! check_path_access; then return 1; fi
+
+    mkdir -p "$CA_PATH" "${CA_PATH}/intermediates"; chmod 700 "$CA_PATH" 2>/dev/null || true
 
     info "Generating CA key (4096 bit)..."
     if [ "$encrypt" = "1" ]; then
@@ -1572,6 +1671,124 @@ do_create_ca_tui() {
     pause
 }
 
+menu_access() {
+    while true; do
+        header; section "Manage access — who can use this script"
+        local is_root=0
+        [ "$(id -u)" -eq 0 ] && is_root=1
+
+        if [ "$is_root" -eq 1 ]; then
+            echo -e "  ${GREEN}Running as root — full access${RESET}"
+        else
+            local current_user; current_user="${SUDO_USER:-${USER:-$(whoami)}}"
+            if acl_check; then
+                echo -e "  ${GREEN}You (${current_user}) have access${RESET}"
+            else
+                echo -e "  ${RED}You (${current_user}) do NOT have access${RESET}"
+                echo -e "  ${DIM}Ask root to add you: sudo mtls.sh users add ${current_user}${RESET}"
+            fi
+        fi
+        echo ""
+
+        # Show currently allowed users
+        local allowed; allowed=$(acl_list)
+        if [ -n "$allowed" ]; then
+            echo -e "  ${BOLD}Allowed users:${RESET}"
+            while IFS= read -r u; do
+                echo -e "    ${GREEN}✔${RESET}  $u"
+            done <<< "$allowed"
+        else
+            echo -e "  ${DIM}No users added yet — only root can use the script.${RESET}"
+        fi
+        echo ""
+
+        # Only root can manage the list
+        if [ "$is_root" -eq 1 ]; then
+            echo -e "  ${BOLD}1)${RESET}  Add user"
+            echo -e "  ${BOLD}2)${RESET}  Remove user"
+            echo -e "  ${BOLD}3)${RESET}  Show all system users"
+            echo -e "  ${BOLD}0)${RESET}  Back"
+            local c; c=$(menu_choice)
+            case "$c" in
+                1)
+                    echo ""
+                    echo -e "  ${DIM}System users (UID >= 1000):${RESET}"
+                    local sys_users; sys_users=$(list_system_users)
+                    if [ -z "$sys_users" ]; then
+                        warn "No regular users found (UID >= 1000)."
+                        echo -e "  ${DIM}You can type any username manually.${RESET}"
+                        echo ""
+                        local uname; uname=$(ask "Username to add" "")
+                        [ -n "$uname" ] && { acl_add "$uname"; ok "User '${uname}' added."; audit_log "user_add" "$uname"; }
+                    else
+                        local i=1 user_arr=()
+                        while IFS= read -r u; do
+                            local mark=" "
+                            local already; already=$(acl_list)
+                            case "$already" in *"$u"*) mark="${GREEN}✔${RESET}" ;; esac
+                            echo -e "    ${CYAN}${i})${RESET} ${mark}  $u"
+                            user_arr+=("$u"); i=$((i + 1))
+                        done <<< "$sys_users"
+                        echo -e "    ${CYAN}m)${RESET}      Manual entry"
+                        echo ""
+                        local choice; choice=$(ask "Select user (number or 'm')" "")
+                        if [ "$choice" = "m" ]; then
+                            local uname; uname=$(ask "Username" "")
+                            [ -n "$uname" ] && { acl_add "$uname"; ok "User '${uname}' added."; audit_log "user_add" "$uname"; }
+                        elif [ -n "$choice" ] && [ "$choice" -ge 1 ] 2>/dev/null && [ "$choice" -le "${#user_arr[@]}" ]; then
+                            local selected="${user_arr[$((choice - 1))]}"
+                            acl_add "$selected"; ok "User '${selected}' added."; audit_log "user_add" "$selected"
+                        else
+                            err "Invalid choice."
+                        fi
+                    fi
+                    pause ;;
+                2)
+                    echo ""
+                    [ -z "$allowed" ] && { warn "No users in the list."; pause; continue; }
+                    echo -e "  ${BOLD}Allowed users:${RESET}"
+                    local i=1 u_arr=()
+                    while IFS= read -r u; do
+                        echo -e "    ${CYAN}${i})${RESET}  $u"
+                        u_arr+=("$u"); i=$((i + 1))
+                    done <<< "$allowed"
+                    echo ""
+                    local choice; choice=$(ask "Select user to remove" "")
+                    if [ -n "$choice" ] && [ "$choice" -ge 1 ] 2>/dev/null && [ "$choice" -le "${#u_arr[@]}" ]; then
+                        local selected="${u_arr[$((choice - 1))]}"
+                        acl_remove "$selected"; ok "User '${selected}' removed."; audit_log "user_remove" "$selected"
+                    else
+                        err "Invalid choice."
+                    fi
+                    pause ;;
+                3)
+                    echo ""
+                    echo -e "  ${BOLD}All system users (UID >= 1000):${RESET}"
+                    echo ""
+                    local sys_users; sys_users=$(list_system_users)
+                    if [ -z "$sys_users" ]; then
+                        warn "No regular users found."
+                    else
+                        while IFS= read -r u; do
+                            local mark=" "
+                            local already; already=$(acl_list)
+                            case "$already" in *"$u"*) mark="${GREEN}✔${RESET}" ;; esac
+                            printf "    %-20s %s\n" "$u" "$mark"
+                        done <<< "$sys_users"
+                    fi
+                    echo ""
+                    pause ;;
+                0) return ;;
+            esac
+        else
+            echo -e "  ${DIM}Only root can manage the access list.${RESET}"
+            echo ""
+            pause
+            return
+        fi
+    done
+}
+
 ensure_ca() {
     if ! ca_exists; then
         warn "Root CA not found."; echo ""
@@ -1601,6 +1818,7 @@ main_menu() {
         echo -e "  ${BOLD}7)${RESET}  Update Traefik config"
         echo -e "  ${BOLD}8)${RESET}  Scan for expiring certificates"
         echo -e "  ${BOLD}9)${RESET}  Backup CA + database"
+        echo -e "  ${BOLD}10)${RESET} Manage access (users)"
         echo ""
         echo -e "  ${BOLD}0)${RESET}  ${DIM}Exit${RESET}"
         local c; c=$(menu_choice)
@@ -1614,6 +1832,7 @@ main_menu() {
             7) do_gen_traefik; pause ;;
             8) core_scan_expiry; pause ;;
             9) do_backup; pause ;;
+            10) menu_access ;;
             0) echo ""; exit 0 ;;
         esac
     done
@@ -1684,6 +1903,18 @@ COMMANDS:
 
   audit [--last N]
       Show audit log entries
+
+  users list
+      Show who is in the allowed-users list
+
+  users add <username>
+      Add a user to the allowed list (root only)
+
+  users remove <username>
+      Remove a user from the allowed list (root only)
+
+  users system
+      Show all system users (UID >= 1000) and their access status
 
   help
       Show this help
@@ -1971,6 +2202,58 @@ cli_cert_renew() {
     core_renew_cert "$uid" "$days"
 }
 
+cli_users() {
+    local subcmd="${1:-}"; shift || true
+    case "$subcmd" in
+        list)
+            local allowed; allowed=$(acl_list)
+            if [ -z "$allowed" ]; then
+                cli_info "No users in the allowed list — only root can use the script."
+                exit 0
+            fi
+            echo "  Allowed users:"
+            while IFS= read -r u; do echo "    $u"; done <<< "$allowed"
+            ;;
+        add)
+            local username="${1:-}"
+            [ -z "$username" ] && { cli_err "Usage: users add <username>"; exit 1; }
+            if [ "$(id -u)" -ne 0 ]; then
+                cli_err "Only root can add users. Run: sudo mtls.sh users add $username"
+                exit 1
+            fi
+            acl_add "$username"
+            cli_ok "User '${username}' added to access list."
+            audit_log "user_add" "$username"
+            ;;
+        remove)
+            local username="${1:-}"
+            [ -z "$username" ] && { cli_err "Usage: users remove <username>"; exit 1; }
+            if [ "$(id -u)" -ne 0 ]; then
+                cli_err "Only root can remove users. Run: sudo mtls.sh users remove $username"
+                exit 1
+            fi
+            acl_remove "$username"
+            cli_ok "User '${username}' removed from access list."
+            audit_log "user_remove" "$username"
+            ;;
+        system)
+            cli_info "System users (UID >= 1000):"
+            local sys_users; sys_users=$(list_system_users)
+            if [ -z "$sys_users" ]; then
+                cli_info "  No regular users found."
+            else
+                while IFS= read -r u; do
+                    local mark=" "
+                    local already; already=$(acl_list)
+                    case "$already" in *"$u"*) mark="  [allowed]" ;; esac
+                    printf "    %-20s %s\n" "$u" "$mark"
+                done <<< "$sys_users"
+            fi
+            ;;
+        *) cli_err "Usage: users <list|add|remove|system>"; exit 1 ;;
+    esac
+}
+
 # =============================================================================
 #  ENTRY POINT
 # =============================================================================
@@ -1983,34 +2266,57 @@ if [ $# -ge 1 ]; then
     MTLS_NONINTERACTIVE=1
     export MTLS_NONINTERACTIVE
     _cmd="$1"; shift
-    db_lock
+
+    # Access control: skip for 'users' and 'help' so non-root can at least
+    # check the list and see help. Root always bypasses.
     case "$_cmd" in
-        ca)
-            # Check for cert renew before subcmd dispatch
-            cli_ca "$@"
-            ;;
-        cert)
-            # Intercept renew to use proper parser
-            if [ "${1:-}" = "renew" ]; then
-                shift
-                cli_cert_renew "$@"
-            else
-                cli_cert "$@"
+        users|help|--help|-h) ;;
+        *)
+            if ! acl_check; then
+                cli_err "Access denied. You are not in the allowed users list."
+                echo ""
+                echo "  Ask root to add you:  sudo mtls.sh users add ${SUDO_USER:-${USER:-$(whoami)}}"
+                echo "  Or run with sudo:     sudo mtls.sh $*"
+                exit 1
             fi
             ;;
-        service) cli_service "$@" ;;
-        config)  cli_config "$@" ;;
-        gen)     do_gen_traefik ;;
-        audit)   cli_audit "$@" ;;
+    esac
+
+    db_lock
+    case "$_cmd" in
+        ca)       cli_ca "$@" ;;
+        cert)
+            if [ "${1:-}" = "renew" ]; then
+                shift; cli_cert_renew "$@"
+            else
+                cli_cert "$@"
+            fi ;;
+        service)  cli_service "$@" ;;
+        config)   cli_config "$@" ;;
+        gen)      do_gen_traefik ;;
+        audit)    cli_audit "$@" ;;
+        users)    cli_users "$@" ;;
         help|--help|-h) cli_usage ;;
-        menu)    MTLS_NONINTERACTIVE=0; db_unlock; main_menu ;;
-        *)       cli_err "Unknown command: $cmd"; echo ""; cli_usage; exit 1 ;;
+        menu)     MTLS_NONINTERACTIVE=0; db_unlock; main_menu ;;
+        *)        cli_err "Unknown command: $_cmd"; echo ""; cli_usage; exit 1 ;;
     esac
     db_unlock
     exit 0
 fi
 
 # TUI mode (no arguments)
+if ! acl_check; then
+    header
+    section "Access denied"
+    local _current_user; _current_user="${SUDO_USER:-${USER:-$(whoami)}}"
+    err "You (${_current_user}) are not in the allowed users list."
+    echo ""
+    echo -e "  ${YELLOW}Options:${RESET}"
+    echo -e "    1. Run with sudo:  ${CYAN}sudo mtls.sh${RESET}"
+    echo -e "    2. Ask root to add you:  ${CYAN}sudo mtls.sh users add ${_current_user}${RESET}"
+    echo ""
+    exit 1
+fi
 db_lock
 main_menu
 db_unlock
