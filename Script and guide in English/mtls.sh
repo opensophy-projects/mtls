@@ -2308,7 +2308,7 @@ fi
 if ! acl_check; then
     header
     section "Access denied"
-    local _current_user; _current_user="${SUDO_USER:-${USER:-$(whoami)}}"
+    _current_user="${SUDO_USER:-${USER:-$(whoami)}}"
     err "You (${_current_user}) are not in the allowed users list."
     echo ""
     echo -e "  ${YELLOW}Options:${RESET}"
