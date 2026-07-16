@@ -1,4 +1,4 @@
-# mtls.sh — mTLS Certificate Manager
+# mtls.sh — mTLS Certificate Manager v2.0
 
 > **Opensophy** — open-source tool for managing mTLS certificates under Traefik.
 > License: MIT
@@ -8,19 +8,37 @@
 
 ---
 
+## What's new in v2.0
+
+- **CLI mode** — all operations available from the command line, no TUI required
+- **Access control** — restrict who can run the script (root always bypasses; non-root users must be added to the allowed list)
+- **Audit log** — every action is logged to `~/.mtls-manager.audit.jsonl` (JSONL format)
+- **CA key encryption** — optional passphrase protection for the root CA private key
+- **Per-service bundles** — `BUNDLE_MODE=per-service` creates a separate `clients-bundle-<service>.crt` per service instead of one shared bundle
+- **Notifications** — webhook + Telegram alerts for expiring/expired certificates
+- **Backup & restore** — `ca backup` / `ca restore` for full CA + DB + config archival
+- **Certificate renewal** — `cert renew` re-issues a certificate with the same name
+- **Certificate verification** — `cert verify` checks the chain and prints details
+- **Chain verification** — all newly signed certificates are verified against the full chain before storing
+- **YAML validation** — generated Traefik config is structurally validated
+- **DB locking** — `flock` prevents concurrent database corruption
+- **Full service deletion** — `service delete-full` revokes all certs, removes files, intermediate CAs, Traefik blocks, and patches
+
+---
+
 ## What the script does
 
-`mtls.sh` is an interactive bash manager for mTLS certificates for the **Traefik** reverse proxy. It allows you to:
+`mtls.sh` is a bash manager for mTLS certificates for the **Traefik** reverse proxy. It allows you to:
 
 - Create and manage a root CA (Certificate Authority)
-- Issue client certificates (`.crt`, `.key`, `.p12`)
+- Issue, renew, revoke, and delete client certificates (`.crt`, `.key`, `.p12`)
 - Automatically generate Traefik configuration with mTLS settings
-- Revoke and delete certificates
 - Work in two Traefik integration modes: creating a new router or patching an existing one
+- Scan for expiring certificates and send notifications
+- Backup and restore the entire CA + database
+- Control who can use the script (access control list)
 
 The script requires no third-party tools beyond `openssl` and `python3` — both are present in any modern Linux environment.
-
-> Run as root user
 
 ---
 
@@ -28,78 +46,171 @@ The script requires no third-party tools beyond `openssl` and `python3` — both
 
 | Dependency | Used for | Required |
 |---|---|---|
-| `openssl` | Generating CA, CSR, signing certificates, CRL, PKCS#12 | ✅ |
-| `python3` | JSON database, YAML patching of Traefik configs | ✅ |
-| `bash` ≥ 4 | The script itself | ✅ |
+| `openssl` | Generating CA, CSR, signing certificates, CRL, PKCS#12 | Yes |
+| `python3` | JSON database, YAML patching of Traefik configs, audit log | Yes |
+| `bash` >= 4 | The script itself | Yes |
+| `flock` | DB locking (prevents concurrent corruption) | Yes (usually in `util-linux`) |
+| `curl` | Webhook / Telegram notifications | Only for notifications |
 | `ip` (iproute2) | Detecting host IP for Traefik target | No (fallback: `172.17.0.1`) |
 
 On startup, the script automatically checks for `openssl` and `python3`. If missing, it offers to install them via `apt-get`, `yum`, `apk`, or `brew`.
 
 ---
 
-## Architecture and structure
-
-```
-mtls.sh
-├── CONFIG        — load/save settings (~/.mtls-manager.conf)
-├── DB            — JSON certificate database (~/.mtls-manager.db)
-├── SERVICES      — JSON service list (~/.mtls-manager.services)
-├── CA            — create root CA, CRL
-├── INT_CA        — intermediate CA per client
-├── BUNDLE        — assemble clients-bundle.crt from all active int-CAs
-├── PATCH         — patch existing Traefik YAML configs
-├── TRAEFIK       — generate mtls-manager.yml
-└── UI            — interactive menu (header, hr, ask, menu_choice...)
-```
-
-Data is stored in three files in the user's home directory:
-
-| File | Format | Contents |
-|---|---|---|
-| `~/.mtls-manager.conf` | KEY="value" | Paths, default validity period |
-| `~/.mtls-manager.db` | JSON | Certificate metadata (name, service, dates, status, paths) |
-| `~/.mtls-manager.services` | JSON array | List of registered services |
-
----
-
 ## Running
+
+### Interactive TUI
 
 ```bash
 chmod +x mtls.sh
 sudo ./mtls.sh
 ```
 
+### CLI mode
+
+```bash
+sudo ./mtls.sh ca create --cn "My-CA" --days 3650
+sudo ./mtls.sh service add --name myapp --domain myapp.example.com --target http://localhost:3000
+sudo ./mtls.sh cert issue --service myapp --name alice --days 365 --note "iPhone Alice" --pass secret123
+sudo ./mtls.sh cert list
+```
+
 > `sudo` is needed if CA and Traefik paths are in `/etc/`. For local testing (preset `p3`), `sudo` is not required.
 
 ---
 
-## Main menu
+## CLI commands
 
 ```
-🔐  mTLS Certificate Manager
+mtls.sh                                        Interactive TUI menu
+mtls.sh <command> [options]                    CLI mode
+
+COMMANDS:
+  ca create [--cn NAME] [--days N] [--encrypt]
+      Create root CA
+
+  ca info
+      Show CA details
+
+  ca backup [--output FILE]
+      Backup CA + DB + config to tar.gz
+
+  ca restore --input FILE
+      Restore from backup
+
+  cert issue --service S --name N [--days D] [--note TEXT] [--pass P]
+      Issue a new client certificate
+
+  cert list [--json]
+      List all certificates
+
+  cert revoke --uid UID | --service S --name N
+      Revoke a certificate (keeps files on disk)
+
+  cert delete --uid UID | --service S --name N
+      Revoke + delete certificate files from disk
+
+  cert renew --uid UID [--days D]
+      Renew an existing certificate (re-issue with same name)
+
+  cert verify --uid UID | --service S --name N
+      Verify certificate chain and show details
+
+  cert scan
+      Scan for expiring/expired certificates, send notifications
+
+  service add --name N --domain D --target T [--mode new|patch]
+      Add a service (for patch mode: --patch-file F --router R)
+
+  service list
+      List all services
+
+  service delete --name N
+      Delete a service (removes from DB, removes patch if patch mode)
+
+  service delete-full --name N
+      Full delete: revoke+delete all client certs, remove client files,
+      remove generated Traefik router/service block, remove patch, remove service
+
+  config show
+      Show current configuration
+
+  config set <key> <value>
+      Set a config value
+
+  gen
+      Generate/update Traefik config
+
+  audit [--last N]
+      Show audit log entries
+
+  users list
+      Show who is in the allowed-users list
+
+  users add <username>
+      Add a user to the allowed list (root only)
+
+  users remove <username>
+      Remove a user from the allowed list (root only)
+
+  users system
+      Show all system users (UID >= 1000) and their access status
+
+  help
+      Show this help
+
+ENVIRONMENT VARIABLES:
+  MTLS_HOST_IP          Override detected host IP
+  MTLS_CA_PASSPHRASE    CA key passphrase (for encrypted keys)
+  MTLS_P12_PASSWORD     Default .p12 password (non-interactive issue)
+  MTLS_NONINTERACTIVE   Set to 1 to skip all prompts
+```
+
+---
+
+## Main menu (TUI)
+
+```
+mTLS Certificate Manager v2.0
 /etc/traefik/dynamic
 CA ✔   services: 2   certificates: 5
 
 1)  Create certificate
-2)  List certificates
+2)  Certificate list
 3)  Revoke / delete certificate
-
-4)  Manage services
-
+4)  Service management
 5)  Create / recreate CA
 6)  Path settings
 7)  Update Traefik config
+8)  Scan for expiring certificates
+9)  Backup CA + database
+10) Manage access (users)
 
 0)  Exit
 ```
 
-CA status and counters are updated every time the main menu is opened.
+---
+
+## Access control
+
+By default, only **root** can use the script. Root can add non-root users to the allowed list:
+
+```bash
+sudo ./mtls.sh users add alice
+sudo ./mtls.sh users add bob
+./mtls.sh users list
+./mtls.sh users system
+```
+
+Non-root users not in the list will see an access denied message with instructions.
+
+In TUI mode, option **10) Manage access** provides an interactive interface for managing the allowed-users list (root only).
 
 ---
 
-## Module: Service management
+## Service management
 
-**Menu → 4**
+**Menu → 4** or `service` CLI commands.
 
 A service is a logical unit to which certificates are issued. Each service corresponds to one protected resource in Traefik.
 
@@ -159,33 +270,41 @@ my-existing-router:
 
 When a service is deleted, the patch is automatically removed.
 
+### Full delete
+
+`service delete-full` (or menu → 4 → 5) performs a complete cleanup:
+- Revoke and delete ALL client certificates for the service
+- Remove client files from disk
+- Remove ALL intermediate CA directories for the service
+- Remove the generated Traefik router/service block (new mode)
+- Remove the mTLS patch from the external config (patch mode)
+- Remove the service from the database
+
 ---
 
-## Module: Certificate creation
+## Certificate operations
 
-**Menu → 1**
+### Issue a certificate
+
+**Menu → 1** or `cert issue`.
 
 Steps:
-
 1. Select a service from the list
 2. Set a certificate name (latin characters, no spaces — spaces are replaced with `-`)
 3. Specify the validity period (default: value from settings, standard is 365 days)
 4. Add a note (for whom / what it was issued)
 5. Set a password for the `.p12` file (can be left empty)
 
-The script sequentially executes:
-
-```
-openssl genrsa          → client.key (2048 bit)
-openssl req -new        → client.csr
-create_int_ca()         → intermediate CA for this client
-sign_client_with_int_ca → client.crt (signed by intermediate CA)
-openssl pkcs12          → client.p12 (key + certificate + root CA)
-rebuild_bundle()        → update clients-bundle.crt
-do_gen_traefik()        → update mtls-manager.yml
-```
-
-The finished `.p12` file can be imported into a browser, mobile device, or used with curl.
+The script then:
+1. Generates a 2048-bit RSA client key
+2. Creates a CSR
+3. Creates an intermediate CA for this client (signed by root CA)
+4. Signs the client certificate with the intermediate CA
+5. Verifies the certificate chain
+6. Creates a `.p12` bundle (key + certificate + root CA)
+7. Rebuilds the bundle file
+8. Updates the Traefik config
+9. Applies the patch (if the service is in patch mode)
 
 ### Output file structure
 
@@ -198,25 +317,31 @@ The finished `.p12` file can be imported into a browser, mobile device, or used 
         └── client.p12   — bundle for import
 ```
 
-> `client.csr` is deleted after signing — no need to store it.
+### Renew a certificate
 
----
+`cert renew --uid UID [--days D]` or no TUI equivalent (CLI only).
 
-## Module: Certificate list
+Revokes the old certificate and re-issues a new one with the same name and service. The note and password are preserved.
 
-**Menu → 2**
+### Verify a certificate
 
-Displays a table of all certificates with columns:
+`cert verify --uid UID` or no TUI equivalent (CLI only).
 
-```
-#    Name                Service        Created     Expires     Status           Note
-1    alice               myapp          2025-01-15  2026-01-15  ACTIVE           iPhone Alice
-2    bob-laptop          myapp          2025-03-01  2025-04-01  EXPIRING (5d)    ...
-3    old-cert            api            2024-01-01  2024-12-31  EXPIRED          ...
-4    revoked             api            2024-06-01  2025-06-01  REVOKED          ...
-```
+Shows certificate details (serial, subject, issuer, validity dates) and verifies the chain against the intermediate CA + root CA.
 
-Statuses:
+### Revoke and delete
+
+**Menu → 3** or `cert revoke` / `cert delete`.
+
+Deletion occurs in **two steps** (protection against accidental deletion):
+
+**Step 1 — Revocation:**
+Sets the `revoked=1` flag in the database, the client's intermediate CA is excluded from `clients-bundle.crt`, and the Traefik config is updated. The certificate stops working immediately — without restarting Traefik.
+
+**Step 2 — File deletion (on re-entry or `cert delete`):**
+Deletes the directory containing `client.key`, `client.crt`, `client.p12`, the intermediate CA directory, and the database entry.
+
+### Certificate statuses
 
 | Status | Condition | Color |
 |---|---|---|
@@ -227,31 +352,28 @@ Statuses:
 
 ---
 
-## Module: Revocation and deletion
+## Expiry scanning and notifications
 
-**Menu → 3**
+**Menu → 8** or `cert scan`.
 
-Deletion occurs in **two steps** (protection against accidental deletion):
+Scans all non-revoked certificates and reports expiring (within `EXPIRY_WARN_DAYS`) and expired ones. If webhook or Telegram notifications are configured, an alert is sent.
 
-**Step 1 — Revocation:**
-Sets the `revoked=1` flag in the database, the client's intermediate CA is excluded from `clients-bundle.crt`, and the Traefik config is updated. The certificate stops working immediately — without restarting Traefik.
-
-**Step 2 — File deletion (on re-entry):**
-Deletes the directory containing `client.key`, `client.crt`, `client.p12`, the intermediate CA directory, and the database entry.
-
-> This two-step process prevents accidental irreversible deletion.
+Notification settings (menu → 6 → 8 or `config set`):
+- `WEBHOOK_URL` — POST JSON `{title, body}` to this URL
+- `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` — send a message via Telegram Bot API
 
 ---
 
-## Module: CA creation
+## CA creation
 
-**Menu → 5**
+**Menu → 5** or `ca create`.
 
 Creates a root CA on first run or recreates it when needed.
 
 ```
 CA name (CN)           → mTLS-Root-CA
 Validity period (days) → 3650
+Encrypt key?           → yes/no
 ```
 
 Generates:
@@ -261,71 +383,100 @@ Generates:
 - `crl.pem` — revocation list (initially empty)
 - `openssl-ca.cnf` — OpenSSL configuration file
 
-> ⚠️ Recreating the CA invalidates all previously issued certificates.
+> Recreating the CA invalidates all previously issued certificates.
+
+### CA key encryption
+
+If encryption is enabled, the CA private key is protected with a passphrase (AES-256). The passphrase must be provided via:
+- Interactive prompt (TUI / `ca create --encrypt`)
+- `MTLS_CA_PASSPHRASE` environment variable (for CLI / automation)
 
 ---
 
-## Module: Path settings
+## Backup and restore
 
-**Menu → 6**
+**Menu → 9** or `ca backup` / `ca restore`.
+
+```bash
+sudo ./mtls.sh ca backup --output /tmp/my-backup.tar.gz
+sudo ./mtls.sh ca restore --input /tmp/my-backup.tar.gz
+```
+
+The backup includes:
+- Config file (`~/.mtls-manager.conf`)
+- Certificate database (`~/.mtls-manager.db`)
+- Services list (`~/.mtls-manager.services`)
+- Audit log (`~/.mtls-manager.audit.jsonl`)
+- All CA files (certificates, keys, intermediate CAs, CRL, etc.)
+
+---
+
+## Audit log
+
+Every action (CA creation, certificate issue/revoke/delete, service add/delete, config changes, user management, backup/restore) is logged to `~/.mtls-manager.audit.jsonl` in JSONL format.
+
+```bash
+sudo ./mtls.sh audit
+sudo ./mtls.sh audit --last 10
+```
+
+Each entry contains: timestamp, action, actor (username), and optional detail.
+
+---
+
+## Path settings
+
+**Menu → 6** or `config show` / `config set`.
 
 | Parameter | Default |
 |---|---|
-| Path to Traefik dynamic configs | `/etc/traefik/dynamic` |
+| Traefik dynamic configs path | `/etc/traefik/dynamic` |
 | CA path | `/etc/traefik/certs/mtls` |
 | Client certificate path | `/etc/traefik/certs/mtls/clients` |
 | Output filename | `mtls-manager.yml` |
 | Certificate validity (days) | `365` |
+| Expiry warning (days) | `30` |
+| Bundle mode | `shared` |
+| CA key encryption | `0` (off) |
+| Webhook URL | (empty) |
+| Telegram bot token | (empty) |
+| Telegram chat ID | (empty) |
 
 Settings are saved to `~/.mtls-manager.conf` with permissions 600.
 
+### Presets
+
+| Preset | Dynamic path | CA path |
+|---|---|---|
+| `p1` Dokploy | `/etc/dokploy/traefik/dynamic` | `/etc/dokploy/traefik/dynamic/certificates/ca` |
+| `p2` Traefik | `/etc/traefik/dynamic` | `/etc/traefik/certs/mtls` |
+| `p3` Local | `./traefik-local/dynamic` | `./traefik-local/certs/mtls` |
+
 ---
 
-## Internal mechanisms
+## Bundle modes
 
-### Database (db_*)
+### `shared` (default)
 
-All metadata is stored in `~/.mtls-manager.db` — a JSON object where the key is `<service>__<certname>`.
+All services share one `clients-bundle.crt` containing intermediate CAs from all active (non-revoked) clients.
 
-```json
-{
-  "myapp__alice": {
-    "name": "alice",
-    "service": "myapp",
-    "days": "365",
-    "note": "iPhone Alice",
-    "created": "2025-01-15",
-    "expires": "2026-01-15",
-    "revoked": "0",
-    "path": "/etc/traefik/certs/mtls/clients/myapp/alice",
-    "serial": "01",
-    "int_ca_path": "/etc/traefik/certs/mtls/intermediates/myapp__alice"
-  },
-  "__ca__": {
-    "cn": "mTLS-Root-CA",
-    "days": "3650",
-    "created": "2025-01-01 10:00:00"
-  }
-}
-```
+### `per-service`
 
-The `__ca__` entry stores root CA metadata and is excluded from client certificate lists (by the `__` prefix).
+Each service gets its own bundle file `clients-bundle-<service>.crt` containing only the intermediate CAs of clients belonging to that service. This provides isolation between services.
 
-All database operations are implemented via built-in Python3 scripts (heredoc `<< 'PYEOF'`) — no external files.
+---
 
-### Bundle (clients-bundle.crt)
+## Data files
 
-The key file for Traefik. Contains the chain of intermediate CAs for all **active** (non-revoked) clients. Traefik uses it to verify incoming client certificates.
+| File | Format | Contents |
+|---|---|---|
+| `~/.mtls-manager.conf` | KEY="value" | Paths, default validity, notification settings |
+| `~/.mtls-manager.db` | JSON | Certificate metadata (name, service, dates, status, paths) |
+| `~/.mtls-manager.services` | JSON array | List of registered services |
+| `~/.mtls-manager.audit.jsonl` | JSONL | Audit log (append-only) |
+| `~/.mtls-manager.users` | JSON array | Allowed users list (for access control) |
 
-```
-rebuild_bundle():
-  for each uid in the database:
-    if revoked != 1:
-      append int-ca.crt to bundle
-  if bundle is empty → use ca.crt
-```
-
-Automatically updated on every change (issuance / revocation).
+All files are created with permissions 600.
 
 ---
 
@@ -340,7 +491,8 @@ Automatically updated on every change (issuance / revocation).
 │   ├── openssl-ca.cnf            ← OpenSSL config
 │   ├── index.txt                 ← CA database
 │   ├── serial                    ← serial counter
-│   ├── clients-bundle.crt        ← bundle of active int-CAs
+│   ├── clients-bundle.crt        ← bundle of active int-CAs (shared mode)
+│   ├── clients-bundle-<svc>.crt  ← per-service bundle (per-service mode)
 │   ├── intermediates/
 │   │   └── <service>__<name>/
 │   │       ├── int-ca.key        ← intermediate CA key
@@ -372,15 +524,6 @@ Why this is needed:
 1. **Granular revocation**: when revoking alice's certificate, `int-ca-alice.crt` is simply excluded from the bundle. Bob is unaffected.
 2. **No CRL on the Traefik side**: no need to configure CRL verification — just rebuild the bundle.
 3. **Immediate effect**: Traefik picks up the updated bundle without a restart (with the file provider enabled).
-
-Int-CA parameters:
-
-```
-basicConstraints = critical, CA:true, pathlen:0
-keyUsage = critical, digitalSignature, cRLSign, keyCertSign
-```
-
-`pathlen:0` means the intermediate CA cannot sign other CAs — only end-entity certificates.
 
 ---
 
@@ -437,13 +580,13 @@ http:
 
 The `http.routers` and `http.services` sections are generated **only** for services in `new` mode. For `patch` services, only the `tls.options` block is created.
 
+After generation, the YAML is structurally validated (checks for `tls:` section, no tabs, etc.).
+
 ---
 
 ## Clearing browser certificate stores
 
 Each time a new `.p12` is issued, the browser stores not only the client certificate but also the intermediate CA. This can lead to accumulation of outdated entries.
-
-Brief instructions:
 
 **Linux (Chrome):**
 ```bash
@@ -459,20 +602,9 @@ Get-ChildItem -Path Cert:\CurrentUser\CA | Where-Object { $_.Subject -like "*ope
 
 ---
 
-## Path presets
-
-| Preset | Dynamic path | CA path |
-|---|---|---|
-| `p1` Dokploy | `/etc/dokploy/traefik/dynamic` | `/etc/dokploy/traefik/dynamic/certificates/ca` |
-| `p2` Traefik | `/etc/traefik/dynamic` | `/etc/traefik/certs/ca` |
-| `p3` Local | `./traefik-local/dynamic` | `./traefik-local/certs/ca` |
-
----
-
 ## Known limitations
 
 - **No ECDSA support**: the script uses RSA (2048-bit for clients, 4096 for CA). ECDSA is not supported.
 - **OCSP/CRL not configurable**: revocation is implemented via bundle, not through standard CRL/OCSP mechanisms.
-- **Single bundle for all services**: all services share one `clients-bundle.crt`. Isolating bundles per service requires script modification.
 - **Python3 YAML parsing**: patching Traefik configs is implemented via line-by-line parsing, not a yaml library. Non-standard YAML formats may not be handled correctly.
-- **No expiry notifications**: the script shows EXPIRING status in the UI but does not send notifications automatically.
+- **Notifications are manual**: `cert scan` must be run manually or via cron — the script does not run as a daemon.
