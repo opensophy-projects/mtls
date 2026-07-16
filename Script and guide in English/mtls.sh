@@ -33,8 +33,7 @@ EXPIRY_WARN_DAYS=30
 CA_KEY_ENCRYPTED=0
 BUNDLE_MODE="shared"   # shared | per-service
 WEBHOOK_URL=""
-TELEGRAM_BOT_TOKEN=""
-TELEGRAM_CHAT_ID=""
+
 NOTIFY_EXPIRY_DAYS=14
 USERS_FILE="${MTLS_USERS_FILE:-${HOME}/.mtls-manager.users}"
 
@@ -117,8 +116,7 @@ load_config() {
             CA_KEY_ENCRYPTED)     CA_KEY_ENCRYPTED="$val" ;;
             BUNDLE_MODE)          BUNDLE_MODE="$val" ;;
             WEBHOOK_URL)          WEBHOOK_URL="$val" ;;
-            TELEGRAM_BOT_TOKEN)   TELEGRAM_BOT_TOKEN="$val" ;;
-            TELEGRAM_CHAT_ID)     TELEGRAM_CHAT_ID="$val" ;;
+
             NOTIFY_EXPIRY_DAYS)   NOTIFY_EXPIRY_DAYS="$val" ;;
         esac
     done < "$CONFIG_FILE"
@@ -135,8 +133,6 @@ EXPIRY_WARN_DAYS="$EXPIRY_WARN_DAYS"
 CA_KEY_ENCRYPTED="$CA_KEY_ENCRYPTED"
 BUNDLE_MODE="$BUNDLE_MODE"
 WEBHOOK_URL="$WEBHOOK_URL"
-TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID="$TELEGRAM_CHAT_ID"
 NOTIFY_EXPIRY_DAYS="$NOTIFY_EXPIRY_DAYS"
 EOF
     chmod 600 "$CONFIG_FILE"
@@ -1062,13 +1058,6 @@ send_notification() {
             -d "{\"title\": \"$title\", \"body\": \"$body\"}" \
             >/dev/null 2>&1 || true
     fi
-    # Telegram
-    if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
-        curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${TELEGRAM_CHAT_ID}" \
-            -d "text=${title}: ${body}" \
-            >/dev/null 2>&1 || true
-    fi
 }
 
 # =============================================================================
@@ -1499,7 +1488,7 @@ core_scan_expiry() {
             cli_warn "Expiring certificates (within ${EXPIRY_WARN_DAYS} days):"
             echo -ne "$expiring" >&2
         fi
-        if [ -n "$WEBHOOK_URL" ] || [ -n "$TELEGRAM_BOT_TOKEN" ]; then
+        if [ -n "$WEBHOOK_URL" ]; then
             alerts="${expired}${expiring}"
             send_notification "mTLS expiry alert" "$(echo -ne "$alerts" | tr -d '\n')"
             ok "Notifications sent."
@@ -1786,7 +1775,7 @@ menu_settings() {
         echo -e "  ${BOLD}5)${RESET}  Default validity (days)\n     ${CYAN}${CERT_DAYS}${RESET}\n"
         echo -e "  ${BOLD}6)${RESET}  Expiry warning (days)\n     ${CYAN}${EXPIRY_WARN_DAYS}${RESET}\n"
         echo -e "  ${BOLD}7)${RESET}  Bundle mode\n     ${CYAN}${BUNDLE_MODE}${RESET} ${DIM}(shared | per-service)${RESET}\n"
-        echo -e "  ${BOLD}8)${RESET}  Notifications\n     ${CYAN}webhook=${WEBHOOK_URL:-none}  telegram=${TELEGRAM_CHAT_ID:-none}${RESET}\n"
+        echo -e "  ${BOLD}8)${RESET}  Notifications\n     ${CYAN}webhook=${WEBHOOK_URL:-none}${RESET}\n"
         echo -e "  ${BOLD}9)${RESET}  CA key encryption\n     ${CYAN}${CA_KEY_ENCRYPTED}${RESET} ${DIM}(0=off 1=on)${RESET}\n"
         hr
         echo -e "  ${DIM}Presets:${RESET}"
@@ -1807,8 +1796,6 @@ menu_settings() {
             8)
                 echo ""
                 WEBHOOK_URL=$(ask "Webhook URL (empty=off)" "$WEBHOOK_URL")
-                TELEGRAM_BOT_TOKEN=$(ask "Telegram bot token (empty=off)" "$TELEGRAM_BOT_TOKEN")
-                TELEGRAM_CHAT_ID=$(ask "Telegram chat ID (empty=off)" "$TELEGRAM_CHAT_ID")
                 save_config; ok "Notification settings saved."; pause ;;
             9)
                 echo ""
@@ -2316,7 +2303,6 @@ cli_config() {
             echo "  CA_KEY_ENCRYPTED     = $CA_KEY_ENCRYPTED"
             echo "  BUNDLE_MODE          = $BUNDLE_MODE"
             echo "  WEBHOOK_URL          = ${WEBHOOK_URL:-<not set>}"
-            echo "  TELEGRAM_CHAT_ID     = ${TELEGRAM_CHAT_ID:-<not set>}"
             echo "  NOTIFY_EXPIRY_DAYS   = $NOTIFY_EXPIRY_DAYS"
             ;;
         set)
@@ -2332,8 +2318,7 @@ cli_config() {
                 CA_KEY_ENCRYPTED)     CA_KEY_ENCRYPTED="$val" ;;
                 BUNDLE_MODE)          BUNDLE_MODE="$val" ;;
                 WEBHOOK_URL)          WEBHOOK_URL="$val" ;;
-                TELEGRAM_BOT_TOKEN)   TELEGRAM_BOT_TOKEN="$val" ;;
-                TELEGRAM_CHAT_ID)     TELEGRAM_CHAT_ID="$val" ;;
+
                 NOTIFY_EXPIRY_DAYS)   NOTIFY_EXPIRY_DAYS="$val" ;;
                 *) cli_err "Unknown key: $key"; exit 1 ;;
             esac

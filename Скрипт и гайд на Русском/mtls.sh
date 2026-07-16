@@ -33,8 +33,7 @@ EXPIRY_WARN_DAYS=30
 CA_KEY_ENCRYPTED=0
 BUNDLE_MODE="shared"   # shared | per-service
 WEBHOOK_URL=""
-TELEGRAM_BOT_TOKEN=""
-TELEGRAM_CHAT_ID=""
+
 NOTIFY_EXPIRY_DAYS=14
 USERS_FILE="${MTLS_USERS_FILE:-${HOME}/.mtls-manager.users}"
 
@@ -117,8 +116,7 @@ load_config() {
             CA_KEY_ENCRYPTED)     CA_KEY_ENCRYPTED="$val" ;;
             BUNDLE_MODE)          BUNDLE_MODE="$val" ;;
             WEBHOOK_URL)          WEBHOOK_URL="$val" ;;
-            TELEGRAM_BOT_TOKEN)   TELEGRAM_BOT_TOKEN="$val" ;;
-            TELEGRAM_CHAT_ID)     TELEGRAM_CHAT_ID="$val" ;;
+
             NOTIFY_EXPIRY_DAYS)   NOTIFY_EXPIRY_DAYS="$val" ;;
         esac
     done < "$CONFIG_FILE"
@@ -135,8 +133,6 @@ EXPIRY_WARN_DAYS="$EXPIRY_WARN_DAYS"
 CA_KEY_ENCRYPTED="$CA_KEY_ENCRYPTED"
 BUNDLE_MODE="$BUNDLE_MODE"
 WEBHOOK_URL="$WEBHOOK_URL"
-TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID="$TELEGRAM_CHAT_ID"
 NOTIFY_EXPIRY_DAYS="$NOTIFY_EXPIRY_DAYS"
 EOF
     chmod 600 "$CONFIG_FILE"
@@ -1062,13 +1058,6 @@ send_notification() {
             -d "{\"title\": \"$title\", \"body\": \"$body\"}" \
             >/dev/null 2>&1 || true
     fi
-    # Telegram
-    if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
-        curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${TELEGRAM_CHAT_ID}" \
-            -d "text=${title}: ${body}" \
-            >/dev/null 2>&1 || true
-    fi
 }
 
 # =============================================================================
@@ -1499,7 +1488,7 @@ core_scan_expiry() {
             cli_warn "Истекающие сертификаты (в течение ${EXPIRY_WARN_DAYS} дней):"
             echo -ne "$expiring" >&2
         fi
-        if [ -n "$WEBHOOK_URL" ] || [ -n "$TELEGRAM_BOT_TOKEN" ]; then
+        if [ -n "$WEBHOOK_URL" ]; then
             alerts="${expired}${expiring}"
             send_notification "mTLS: предупреждение об истечении" "$(echo -ne "$alerts" | tr -d '\n')"
             ok "Уведомления отправлены."
@@ -1786,7 +1775,7 @@ menu_settings() {
         echo -e "  ${BOLD}5)${RESET}  Срок по умолчанию (дней)\n     ${CYAN}${CERT_DAYS}${RESET}\n"
         echo -e "  ${BOLD}6)${RESET}  Предупреждение об истечении (дней)\n     ${CYAN}${EXPIRY_WARN_DAYS}${RESET}\n"
         echo -e "  ${BOLD}7)${RESET}  Режим bundle\n     ${CYAN}${BUNDLE_MODE}${RESET} ${DIM}(shared | per-service)${RESET}\n"
-        echo -e "  ${BOLD}8)${RESET}  Уведомления\n     ${CYAN}webhook=${WEBHOOK_URL:-нет}  telegram=${TELEGRAM_CHAT_ID:-нет}${RESET}\n"
+        echo -e "  ${BOLD}8)${RESET}  Уведомления\n     ${CYAN}webhook=${WEBHOOK_URL:-нет}${RESET}\n"
         echo -e "  ${BOLD}9)${RESET}  Шифрование ключа CA\n     ${CYAN}${CA_KEY_ENCRYPTED}${RESET} ${DIM}(0=выкл 1=вкл)${RESET}\n"
         hr
         echo -e "  ${DIM}Пресеты:${RESET}"
@@ -1807,8 +1796,6 @@ menu_settings() {
             8)
                 echo ""
                 WEBHOOK_URL=$(ask "URL webhook (пусто=выкл)" "$WEBHOOK_URL")
-                TELEGRAM_BOT_TOKEN=$(ask "Токен Telegram-бота (пусто=выкл)" "$TELEGRAM_BOT_TOKEN")
-                TELEGRAM_CHAT_ID=$(ask "ID чата Telegram (пусто=выкл)" "$TELEGRAM_CHAT_ID")
                 save_config; ok "Настройки уведомлений сохранены."; pause ;;
             9)
                 echo ""
@@ -2317,7 +2304,6 @@ cli_config() {
             echo "  CA_KEY_ENCRYPTED     = $CA_KEY_ENCRYPTED"
             echo "  BUNDLE_MODE          = $BUNDLE_MODE"
             echo "  WEBHOOK_URL          = ${WEBHOOK_URL:-<не задан>}"
-            echo "  TELEGRAM_CHAT_ID     = ${TELEGRAM_CHAT_ID:-<не задан>}"
             echo "  NOTIFY_EXPIRY_DAYS   = $NOTIFY_EXPIRY_DAYS"
             ;;
         set)
@@ -2333,8 +2319,7 @@ cli_config() {
                 CA_KEY_ENCRYPTED)     CA_KEY_ENCRYPTED="$val" ;;
                 BUNDLE_MODE)          BUNDLE_MODE="$val" ;;
                 WEBHOOK_URL)          WEBHOOK_URL="$val" ;;
-                TELEGRAM_BOT_TOKEN)   TELEGRAM_BOT_TOKEN="$val" ;;
-                TELEGRAM_CHAT_ID)     TELEGRAM_CHAT_ID="$val" ;;
+
                 NOTIFY_EXPIRY_DAYS)   NOTIFY_EXPIRY_DAYS="$val" ;;
                 *) cli_err "Неизвестный ключ: $key"; exit 1 ;;
             esac

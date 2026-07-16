@@ -15,7 +15,7 @@
 - **Audit log** — every action is logged to `~/.mtls-manager.audit.jsonl` (JSONL format)
 - **CA key encryption** — optional passphrase protection for the root CA private key
 - **Per-service bundles** — `BUNDLE_MODE=per-service` creates a separate `clients-bundle-<service>.crt` per service instead of one shared bundle
-- **Notifications** — webhook + Telegram alerts for expiring/expired certificates
+- **Notifications** — webhook alerts for expiring/expired certificates
 - **Backup & restore** — `ca backup` / `ca restore` for full CA + DB + config archival
 - **Certificate renewal** — `cert renew` re-issues a certificate with the same name
 - **Certificate verification** — `cert verify` checks the chain and prints details
@@ -42,6 +42,29 @@ The script requires no third-party tools beyond `openssl` and `python3` — both
 
 ---
 
+## How the script solves certificate revocation
+
+**The problem:** Traefik has no built-in mechanism for revoking client certificates. Once a certificate is trusted via `caFiles`, there is no native way to invalidate a single client without removing the entire CA or restarting with a new configuration.
+
+**The solution:** The script creates a **separate intermediate CA for each client certificate**. Instead of trusting individual client certs directly, Traefik trusts a **bundle file** (`clients-bundle.crt`) that contains only the intermediate CAs of *active* (non-revoked) clients.
+
+**How revocation works in practice:**
+
+1. When a certificate is issued, a unique intermediate CA is created and signed by the root CA. The client certificate is then signed by this intermediate CA. The intermediate CA is added to the bundle file.
+2. When a certificate is revoked, the script simply **removes the corresponding intermediate CA from the bundle file**. The client's certificate is no longer trusted by Traefik — the connection is rejected immediately.
+3. The Traefik config is regenerated and the bundle file is updated. With Traefik's file provider enabled, the change takes effect **without a restart** — Traefik watches the file and reloads automatically.
+
+**Why this approach works:**
+
+- No CRL or OCSP infrastructure needed — Traefik does not need to be configured for revocation checking
+- Granular revocation — revoking one client does not affect any other client
+- Immediate effect — the revoked client is blocked as soon as the bundle file is rebuilt
+- No Traefik restart required — the file provider handles hot-reloading
+
+This is the core design principle of the script: **per-client intermediate CAs + bundle file = revocation without CRL/OCSP and without Traefik restarts**.
+
+---
+
 ## Dependencies and requirements
 
 | Dependency | Used for | Required |
@@ -50,7 +73,7 @@ The script requires no third-party tools beyond `openssl` and `python3` — both
 | `python3` | JSON database, YAML patching of Traefik configs, audit log | Yes |
 | `bash` >= 4 | The script itself | Yes |
 | `flock` | DB locking (prevents concurrent corruption) | Yes (usually in `util-linux`) |
-| `curl` | Webhook / Telegram notifications | Only for notifications |
+| `curl` | Webhook notifications | Only for notifications |
 | `ip` (iproute2) | Detecting host IP for Traefik target | No (fallback: `172.17.0.1`) |
 
 On startup, the script automatically checks for `openssl` and `python3`. If missing, it offers to install them via `apt-get`, `yum`, `apk`, or `brew`.
@@ -356,11 +379,10 @@ Deletes the directory containing `client.key`, `client.crt`, `client.p12`, the i
 
 **Menu → 8** or `cert scan`.
 
-Scans all non-revoked certificates and reports expiring (within `EXPIRY_WARN_DAYS`) and expired ones. If webhook or Telegram notifications are configured, an alert is sent.
+Scans all non-revoked certificates and reports expiring (within `EXPIRY_WARN_DAYS`) and expired ones. If a webhook notification URL is configured, an alert is sent.
 
 Notification settings (menu → 6 → 8 or `config set`):
 - `WEBHOOK_URL` — POST JSON `{title, body}` to this URL
-- `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` — send a message via Telegram Bot API
 
 ---
 
@@ -439,8 +461,7 @@ Each entry contains: timestamp, action, actor (username), and optional detail.
 | Bundle mode | `shared` |
 | CA key encryption | `0` (off) |
 | Webhook URL | (empty) |
-| Telegram bot token | (empty) |
-| Telegram chat ID | (empty) |
+
 
 Settings are saved to `~/.mtls-manager.conf` with permissions 600.
 
