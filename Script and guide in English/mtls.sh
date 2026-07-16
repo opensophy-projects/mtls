@@ -254,16 +254,39 @@ list_system_users() {
     done < /etc/passwd
 }
 
-# Check if CA path is writable by the current user; if not, show guidance
+# Check if a given path is writable by the current user; if not, show guidance.
+# Usage: check_path_access "/some/path"  OR  check_path_access  (defaults to $CA_PATH)
 check_path_access() {
-    local test_path="$CA_PATH"
+    local test_path="${1:-$CA_PATH}"
     # Root always passes
     [ "$(id -u)" -eq 0 ] && return 0
 
-    # Check if we can create the CA path
-    if ! mkdir -p "$test_path" 2>/dev/null; then
+    # If path already exists, check writability directly
+    if [ -d "$test_path" ]; then
+        if [ ! -w "$test_path" ]; then
+            echo ""
+            echo -e "  ${RED}✖${RESET}  No write access to: ${test_path}"
+            echo ""
+            echo -e "  ${YELLOW}Options:${RESET}"
+            echo -e "    1. Run with sudo:  ${CYAN}sudo mtls.sh${RESET}"
+            echo -e "    2. Change paths in Settings → use a local preset (p3)"
+            echo -e "    3. Ask root to grant access:  ${CYAN}sudo mtls.sh users add \$USER${RESET}"
+            echo ""
+            return 1
+        fi
+        return 0
+    fi
+
+    # Path does not exist — try to create it (walk up to first existing parent)
+    local parent="$test_path"
+    while [ "$parent" != "/" ] && [ ! -d "$parent" ]; do
+        parent="$(dirname "$parent")"
+    done
+    if [ "$parent" = "/" ]; then parent="/"; fi
+    if [ ! -w "$parent" ]; then
         echo ""
-        echo -e "  ${RED}✖${RESET}  No write access to: ${test_path}"
+        echo -e "  ${RED}✖${RESET}  No write access to create: ${test_path}"
+        echo -e "  ${DIM}Parent directory not writable: ${parent}${RESET}"
         echo ""
         echo -e "  ${YELLOW}Options:${RESET}"
         echo -e "    1. Run with sudo:  ${CYAN}sudo mtls.sh${RESET}"
@@ -273,6 +296,33 @@ check_path_access() {
         return 1
     fi
     return 0
+}
+
+# Check all configured paths at once (called at startup and before operations)
+check_all_paths() {
+    local failed=0
+    for p in "$CA_PATH" "$CLIENTS_PATH" "$TRAEFIK_DYNAMIC_PATH"; do
+        if ! check_path_access "$p" >/dev/null 2>&1; then
+            failed=1
+        fi
+    done
+    if [ "$failed" -eq 1 ]; then
+        return 1
+    fi
+    return 0
+}
+
+# Show a clear permission error for a specific path
+show_permission_error() {
+    local path="$1"
+    echo ""
+    echo -e "  ${RED}✖${RESET}  Permission denied: ${path}"
+    echo ""
+    echo -e "  ${YELLOW}Fix options:${RESET}"
+    echo -e "    1. Run with sudo:      ${CYAN}sudo mtls.sh${RESET}"
+    echo -e "    2. Use local preset:   start script → 6 → p3"
+    echo -e "    3. Ask root to add you: ${CYAN}sudo mtls.sh users add \$USER${RESET}"
+    echo ""
 }
 
 db_write() {
@@ -859,6 +909,10 @@ PYEOF
 # =============================================================================
 do_gen_traefik() {
     local out="${TRAEFIK_DYNAMIC_PATH}/${OUTPUT_FILE}"
+    if ! check_path_access "$TRAEFIK_DYNAMIC_PATH" 2>/dev/null; then
+        show_permission_error "$TRAEFIK_DYNAMIC_PATH"
+        return 1
+    fi
     mkdir -p "$TRAEFIK_DYNAMIC_PATH"
     if [ ! -f "${CA_PATH}/ca.crt" ]; then
         warn "CA not found — Traefik config was not updated."; return 1
@@ -1115,10 +1169,12 @@ core_create_ca() {
         ask_yn "Recreate CA?" || return 1
     fi
 
-    # Check if we can write to the CA path
-    if ! check_path_access; then return 1; fi
+    # Check if we can write to the CA path and Traefik dynamic path
+    if ! check_path_access "$CA_PATH"; then return 1; fi
+    if ! check_path_access "$TRAEFIK_DYNAMIC_PATH"; then return 1; fi
 
-    mkdir -p "$CA_PATH" "${CA_PATH}/intermediates"; chmod 700 "$CA_PATH" 2>/dev/null || true
+    mkdir -p "$CA_PATH" "${CA_PATH}/intermediates" 2>/dev/null || true
+    chmod 700 "$CA_PATH" 2>/dev/null || true
 
     info "Generating CA key (4096 bit)..."
     if [ "$encrypt" = "1" ]; then
@@ -1173,8 +1229,17 @@ core_issue_cert() {
         db_write "$uid" "revoked" "1"; rebuild_bundle
     fi
 
+    # Check write access to CLIENTS_PATH and CA_PATH (intermediate CA is
+    # created under $CA_PATH/intermediates/) before generating any files.
+    if ! check_path_access "$CLIENTS_PATH"; then
+        return 1
+    fi
+    if ! check_path_access "$CA_PATH"; then
+        return 1
+    fi
+
     local cert_dir="${CLIENTS_PATH}/${service}/${cert_name}"
-    mkdir -p "$cert_dir"; chmod 700 "$cert_dir"
+    mkdir -p "$cert_dir"; chmod 700 "$cert_dir" 2>/dev/null || true
 
     info "Generating key (2048 bit)..."
     openssl genrsa -out "${cert_dir}/client.key" 2048 2>/dev/null; chmod 600 "${cert_dir}/client.key"
@@ -1309,6 +1374,82 @@ core_delete_cert() {
     db_delete "$uid"
     ok "Record removed from database."
     audit_log "cert_delete" "uid=${uid} name=${cname}"
+}
+
+# Full service removal: revoke + delete all client certificates, remove generated
+# Traefik router/service block, remove patch from external file, delete the service
+# folder on disk, and finally remove the service from the services DB.
+# Usage: core_delete_service_full <service_name>
+core_delete_service_full() {
+    local svc="$1"
+    [ -z "$svc" ] && { err "Service name required."; return 1; }
+
+    local svc_mode; svc_mode=$(svc_get "$svc" "mode")
+    local deleted_certs=0
+    local all_names; all_names=$(db_list_names)
+
+    # 1. Revoke + delete every certificate that belongs to this service
+    if [ -n "$all_names" ]; then
+        while IFS= read -r uid; do
+            [ -z "$uid" ] && continue
+            local uid_svc; uid_svc=$(db_read "$uid" "service")
+            [ "$uid_svc" != "$svc" ] && continue
+            local crevoked; crevoked=$(db_read "$uid" "revoked")
+            [ "$crevoked" != "1" ] && core_revoke_cert "$uid" >/dev/null 2>&1 || true
+            core_delete_cert "$uid" >/dev/null 2>&1 || true
+            deleted_certs=$((deleted_certs + 1))
+        done <<< "$all_names"
+    fi
+    [ "$deleted_certs" -gt 0 ] && ok "Deleted ${deleted_certs} certificate(s) for '${svc}'."
+
+    # 2. Remove patch from external file (patch mode)
+    if [ "$svc_mode" = "patch" ]; then
+        local dpf dpr
+        dpf=$(svc_get "$svc" "patch_file")
+        dpr=$(svc_get "$svc" "patch_router")
+        if [ -n "$dpf" ] && [ -f "$dpf" ]; then
+            info "Removing patch from ${dpf} (router: ${dpr})..."
+            patch_remove "$svc" "$dpf" "$dpr"
+            ok "Patch removed from ${dpf##*/}."
+        fi
+    fi
+
+    # 3. Remove the generated Traefik config block for this service (new mode).
+    #    The simplest reliable way is to regenerate the whole file after the
+    #    service is gone from the DB — do_gen_traefik() handles that.
+    # 4. Remove the service folder on disk (client certs)
+    local svc_dir="${CLIENTS_PATH}/${svc}"
+    if [ -d "$svc_dir" ]; then
+        rm -rf "$svc_dir"
+        ok "Removed client directory: ${svc_dir}"
+    fi
+
+    # 4b. Remove any orphaned intermediate CA directories for this service.
+    #     Intermediate CAs are stored as $CA_PATH/intermediates/<service>__<name>
+    #     and may not always have an int_ca_path recorded in the DB (e.g. if the
+    #     DB entry was lost). Scan the folder to be thorough.
+    local int_base="${CA_PATH}/intermediates"
+    if [ -d "$int_base" ]; then
+        local orphaned=0
+        while IFS= read -r -d '' int_dir; do
+            local base; base=$(basename "$int_dir")
+            # intermediate dirs are named <service>__<certname>
+            case "$base" in
+                "${svc}__"*) rm -rf "$int_dir"; orphaned=$((orphaned + 1)) ;;
+            esac
+        done < <(find "$int_base" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+        [ "$orphaned" -gt 0 ] && ok "Removed ${orphaned} orphaned intermediate CA directory(ies)."
+    fi
+
+    # 5. Remove the service from the services DB
+    svc_delete "$svc"
+
+    # 6. Regenerate Traefik config (router/service block disappears)
+    do_gen_traefik >/dev/null 2>&1 || true
+
+    ok "Service '${svc}' fully removed."
+    audit_log "service_delete_full" "name=${svc} certs=${deleted_certs} mode=${svc_mode}"
+    return 0
 }
 
 core_renew_cert() {
@@ -1535,8 +1676,9 @@ menu_services() {
         fi
         echo -e "  ${BOLD}1)${RESET}  Add service [new]    — new domain"
         echo -e "  ${BOLD}2)${RESET}  Add service [patch]  — existing router"
-        echo -e "  ${BOLD}3)${RESET}  Delete service"
+        echo -e "  ${BOLD}3)${RESET}  Delete service       — remove from DB only"
         echo -e "  ${BOLD}4)${RESET}  Update Traefik config"
+        echo -e "  ${BOLD}5)${RESET}  Full delete service  — revoke+delete all certs, remove files & Traefik block"
         echo -e "  ${BOLD}0)${RESET}  Back"
         local c; c=$(menu_choice)
         case "$c" in
@@ -1608,6 +1750,27 @@ PYEOF
                 fi
                 pause ;;
             4) do_gen_traefik; pause ;;
+            5)
+                [ -z "$svc_names" ] && { warn "No services."; pause; continue; }
+                echo ""
+                local s_arr5=()
+                while IFS= read -r s; do [ -z "$s" ] && continue; s_arr5+=("$s"); done <<< "$svc_names"
+                local sc5; sc5=$(ask "Service number to fully delete" "")
+                [ -z "$sc5" ] && { pause; continue; }
+                local sdel5="${s_arr5[$((sc5 - 1))]}"
+                if [ -z "$sdel5" ]; then err "Invalid number."; pause; continue; fi
+                echo ""
+                warn "FULL DELETE will:"
+                warn "  - revoke and delete ALL client certificates for '${sdel5}'"
+                warn "  - remove client files from disk (${CLIENTS_PATH}/${sdel5})"
+                warn "  - remove ALL intermediate CAs for '${sdel5}' (${CA_PATH}/intermediates/${sdel5}__*)"
+                warn "  - remove the generated Traefik router/service block (new mode)"
+                warn "  - remove the mTLS patch from the external config (patch mode)"
+                warn "  - remove the service from the database"
+                echo ""
+                ask_yn "Proceed with FULL delete of '${sdel5}'? (irreversible)" || { ok "Cancelled."; pause; continue; }
+                core_delete_service_full "$sdel5"
+                pause ;;
             0) return ;;
         esac
     done
@@ -1890,7 +2053,11 @@ COMMANDS:
       List all services
 
   service delete --name N
-      Delete a service
+      Delete a service (removes from DB, removes patch if patch mode)
+
+  service delete-full --name N
+      Full delete: revoke+delete all client certs, remove client files,
+      remove generated Traefik router/service block, remove patch, remove service
 
   config show
       Show current configuration
@@ -2123,6 +2290,15 @@ cli_service() {
             cli_ok "Service '${name}' deleted."
             audit_log "service_delete" "name=${name}"
             ;;
+        delete-full)
+            local name=""
+            while [ $# -gt 0 ]; do
+                case "$1" in --name) name="$2"; shift 2 ;; *) shift ;; esac
+            done
+            [ -z "$name" ] && { cli_err "--name required"; exit 1; }
+            cli_info "Full delete: revoking + deleting all certs, removing files and Traefik block for '${name}'..."
+            core_delete_service_full "$name"
+            ;;
         *) cli_err "Unknown service subcommand: ${subcmd}"; cli_usage; exit 1 ;;
     esac
 }
@@ -2255,6 +2431,33 @@ cli_users() {
 }
 
 # =============================================================================
+#  STARTUP PATH CHECK — warn early if configured paths are not writable
+# =============================================================================
+warn_path_access() {
+    [ "$(id -u)" -eq 0 ] && return 0
+    local failed=0
+    for p in "$CA_PATH" "$CLIENTS_PATH" "$TRAEFIK_DYNAMIC_PATH"; do
+        if ! check_path_access "$p" >/dev/null 2>&1; then
+            failed=1
+        fi
+    done
+    if [ "$failed" -eq 1 ]; then
+        echo ""
+        echo -e "  ${YELLOW}!${RESET}  ${BOLD}Warning: some configured paths are not writable by your user.${RESET}"
+        echo -e "  ${DIM}CA path         : ${CA_PATH}${RESET}"
+        echo -e "  ${DIM}Clients path    : ${CLIENTS_PATH}${RESET}"
+        echo -e "  ${DIM}Traefik dynamic : ${TRAEFIK_DYNAMIC_PATH}${RESET}"
+        echo ""
+        echo -e "  ${YELLOW}Fix options:${RESET}"
+        echo -e "    1. Run with sudo:      ${CYAN}sudo mtls.sh${RESET}"
+        echo -e "    2. Use local preset:   start script → 6 → p3"
+        echo -e "    3. Ask root to add you: ${CYAN}sudo mtls.sh users add \$USER${RESET}"
+        echo ""
+    fi
+    return 0
+}
+
+# =============================================================================
 #  ENTRY POINT
 # =============================================================================
 load_config
@@ -2297,7 +2500,7 @@ if [ $# -ge 1 ]; then
         audit)    cli_audit "$@" ;;
         users)    cli_users "$@" ;;
         help|--help|-h) cli_usage ;;
-        menu)     MTLS_NONINTERACTIVE=0; db_unlock; main_menu ;;
+        menu)     MTLS_NONINTERACTIVE=0; db_unlock; warn_path_access; main_menu ;;
         *)        cli_err "Unknown command: $_cmd"; echo ""; cli_usage; exit 1 ;;
     esac
     db_unlock
@@ -2317,6 +2520,7 @@ if ! acl_check; then
     echo ""
     exit 1
 fi
+warn_path_access
 db_lock
 main_menu
 db_unlock
