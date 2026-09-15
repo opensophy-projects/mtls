@@ -845,8 +845,8 @@ rebuild_bundle() {
     local count=0
 
     if [ "$BUNDLE_MODE" = "per-service" ]; then
-        local services_done=""
-        if [ -n "$names" ]; then
+  local services_done="" uid=""
+  if [ -n "$names" ]; then
             while IFS= read -r uid; do
                 [ -z "$uid" ] && continue
                 local svc; svc=$(db_read "$uid" "service")
@@ -1254,8 +1254,9 @@ do_gen_traefik() {
         warn "CA не найден — конфиг Traefik не обновлён."; return 1
     fi
     rebuild_bundle
-    local host_ip; host_ip=$(detect_host_ip)
-    local svc_names; svc_names=$(svc_list_names)
+  local host_ip; host_ip=$(detect_host_ip)
+  local svc=""
+  local svc_names; svc_names=$(svc_list_names)
     local has_new_svc=0
     if [ -n "$svc_names" ]; then
         while IFS= read -r svc; do
@@ -1880,8 +1881,8 @@ core_delete_service_full() {
     validate_name "Имя сервиса" "$svc" || return 1
 
     local svc_mode; svc_mode=$(svc_get "$svc" "mode")
-    local deleted_certs=0
-    local all_names; all_names=$(db_list_names)
+  local deleted_certs=0 uid=""
+  local all_names; all_names=$(db_list_names)
 
     if [ -n "$all_names" ]; then
         while IFS= read -r uid; do

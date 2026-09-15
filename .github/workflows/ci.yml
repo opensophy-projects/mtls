@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install checks
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck
+      - name: Bash syntax
+        run: bash -n mtls.sh tests/mtls_smoke.sh
+      - name: ShellCheck
+        run: shellcheck --severity=warning mtls.sh tests/mtls_smoke.sh
+      - name: Smoke and security tests
+        run: bash tests/mtls_smoke.sh
