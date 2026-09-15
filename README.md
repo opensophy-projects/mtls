@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Безопасный CLI/TUI-менеджер mTLS-сертификатов для Traefik**
+**CLI/TUI-менеджер mTLS-сертификатов для Traefik**
 
 [![CI](https://github.com/opensophy-projects/mtls/actions/workflows/ci.yml/badge.svg)](https://github.com/opensophy-projects/mtls/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
