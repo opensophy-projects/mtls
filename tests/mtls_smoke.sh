@@ -22,6 +22,23 @@ run_mtls config set TRAEFIK_DYNAMIC_PATH "$TMP/traefik" >/dev/null
 run_mtls config set CA_PATH "$TMP/ca" >/dev/null
 run_mtls config set CLIENTS_PATH "$TMP/clients" >/dev/null
 run_mtls ca create --cn ci-test-ca --days 30 >/dev/null
+
+# Negative security cases: non-root access, traversal-like identifiers, and malicious backups.
+if id nobody >/dev/null 2>&1; then
+  ! sudo -u nobody env HOME="$TMP/home" MTLS_CONFIG_FILE="$TMP/state.conf" bash "$SCRIPT" help >/dev/null 2>&1
+fi
+! run_mtls service add --name '../escape' --domain api.example.test --target http://127.0.0.1:8080 >/dev/null 2>&1
+python3 - "$TMP/malicious.tar.gz" <<'PY'
+import sys, tarfile, io
+with tarfile.open(sys.argv[1], 'w:gz') as archive:
+    data = b'escape'
+    member = tarfile.TarInfo('../../mtls-escape-marker')
+    member.size = len(data)
+    archive.addfile(member, io.BytesIO(data))
+PY
+! run_mtls ca restore --input "$TMP/malicious.tar.gz" >/dev/null 2>&1
+test ! -e "$TMP/mtls-escape-marker"
+
 run_mtls preset save --name ci --traefik-path "$TMP/traefik" --ca-path "$TMP/ca" --clients-path "$TMP/clients" --output-file ci.yml >/dev/null
 run_mtls preset list | grep -q '^ci '
 run_mtls preset apply --name ci >/dev/null

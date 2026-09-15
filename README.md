@@ -32,14 +32,31 @@
 
 ## Быстрый старт
 
+Скрипт намеренно требует UID 0: он создаёт и читает приватные ключи CA и клиентов. Варианты запуска:
+
 ```bash
+# Вариант A: каждый вызов получает root через sudo
 sudo ./mtls.sh help
 sudo ./mtls.sh ca create --cn my-root-ca
+
+# Вариант B: открыть root-shell и запускать без повторного sudo
+sudo -i
+cd /path/to/mtls
+bash ./mtls.sh help
+bash ./mtls.sh ca create --cn my-root-ca
+exit
+```
+
+После инициализации можно продолжить командами от root:
+
+```bash
 sudo ./mtls.sh service add --name api --domain api.example.test --target http://127.0.0.1:8080
 sudo ./mtls.sh gen
 sudo ./mtls.sh cert issue --service api --name alice --pass 'use-a-strong-password'
 sudo ./mtls.sh cert verify --service api --name alice
 ```
+
+`sudo -i` не является обязательным — это только удобный способ выполнить несколько операций в одной root-сессии. Никогда не запускайте скрипт от обычного пользователя.
 
 Для production не передавайте секреты в командной строке: значение `--pass` может попасть в history или process list. Используйте интерактивный режим либо контролируемое окружение CI с защищёнными секретами.
 
