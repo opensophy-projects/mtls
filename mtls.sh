@@ -560,8 +560,37 @@ for s in svcs:
 PYEOF
 }
 
-svc_add() {
-    local name="$1" domain="$2" target="$3" mode="${4:-new}" patch_file="${5:-}" patch_router="${6:-}"
+  validate_domain() {
+  local value="$1"
+  [[ "$value" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || {
+    cli_err "Некорректный домен: $value"; return 1;
+  }
+  }
+
+  validate_target() {
+  local value="$1"
+  [[ "$value" =~ ^https?://[A-Za-z0-9._:-]+(/[A-Za-z0-9._~:/?#\[\]@!\$&()*+,;=%-]*)?$ ]] || {
+    cli_err "Некорректный upstream URL"; return 1;
+  }
+  }
+
+  validate_patch_path() {
+  local path="$1" current="$1" parent
+  [ -n "$path" ] && [ -f "$path" ] && [ ! -L "$path" ] || {
+    cli_err "Patch-файл должен быть обычным файлом: $path"; return 1;
+  }
+  while [ "$current" != "/" ] && [ -n "$current" ]; do
+    [ ! -L "$current" ] || { cli_err "Patch-путь содержит symlink: $current"; return 1; }
+    current="$(dirname -- "$current")"
+  done
+  }
+
+  svc_add() {
+  local name="$1" domain="$2" target="$3" mode="${4:-new}" patch_file="${5:-}" patch_router="${6:-}"
+  validate_name "Имя сервиса" "$name" || return 1
+  validate_domain "$domain" || return 1
+  validate_target "$target" || return 1
+  [ -z "$patch_file" ] || validate_patch_path "$patch_file" || return 1
     local tmp; tmp=$(mktemp "${SERVICES_FILE}.XXXXXX")
     python3 - "$SERVICES_FILE" "$name" "$domain" "$target" "$mode" "$patch_file" "$patch_router" "$tmp" << 'PYEOF'
 import sys, json
@@ -1122,8 +1151,10 @@ print('valid')
 PYEOF
 }
 
-patch_apply() {
-    local svc="$1" patch_file="$2" router_name="$3"
+  patch_apply() {
+  local svc="$1" patch_file="$2" router_name="$3"
+  validate_name "Имя сервиса" "$svc" || return 1
+  validate_patch_path "$patch_file" || return 1
     local tls_opt="mtls-${svc}"
     local tmp_result; tmp_result=$(mktemp "${patch_file}.patchtmp.XXXXXX")
 
@@ -1195,8 +1226,10 @@ PYEOF
     esac
 }
 
-patch_remove() {
-    local svc="$1" patch_file="$2" router_name="$3"
+  patch_remove() {
+  local svc="$1" patch_file="$2" router_name="$3"
+  validate_name "Имя сервиса" "$svc" || return 1
+  validate_patch_path "$patch_file" || return 1
     local tls_opt="mtls-${svc}"
     local tmp_result; tmp_result=$(mktemp "${patch_file}.patchtmp.XXXXXX")
 
@@ -1302,6 +1335,7 @@ do_gen_traefik() {
                 local mode; mode=$(svc_get "$svc" "mode")
                 [ "$mode" != "new" ] && continue
                 local domain; domain=$(svc_get "$svc" "domain")
+                validate_domain "$domain" || { err "Сервис $svc содержит некорректный домен; YAML не создан."; return 1; }
                 echo "    ${svc}-mtls:"
                 echo "      rule: \"Host(\`${domain}\`)\""
                 echo "      entryPoints:"
@@ -1316,6 +1350,7 @@ do_gen_traefik() {
                 local mode; mode=$(svc_get "$svc" "mode")
                 [ "$mode" != "new" ] && continue
                 local target; target=$(svc_get "$svc" "target")
+                validate_target "$target" || { err "Сервис $svc содержит некорректный upstream; YAML не создан."; return 1; }
                 target="${target//localhost/${host_ip}}"
                 target="${target//127.0.0.1/${host_ip}}"
                 echo "    ${svc}-mtls:"
@@ -1373,8 +1408,24 @@ do_restore() {
     warn "Это перезапишет CA, БД и конфиг. Продолжить?"
     ask_yn "Восстановить из $src?" || { info "Отменено."; return 0; }
     local tmp_dir; tmp_dir=$(mktemp -d)
-    tar xzf "$src" -C "$tmp_dir" 2>/dev/null
-    [ -f "${tmp_dir}${CONFIG_FILE}" ] && cp "${tmp_dir}${CONFIG_FILE}" "$CONFIG_FILE"
+    if ! python3 - "$src" "$tmp_dir" <<'PYEOF'
+import os, sys, tarfile
+src, dest = sys.argv[1:]
+root = os.path.realpath(dest) + os.sep
+with tarfile.open(src, "r:gz") as archive:
+    for member in archive.getmembers():
+        name = member.name
+        target = os.path.realpath(os.path.join(dest, name))
+        if not target.startswith(root) or member.issym() or member.islnk() or not (member.isfile() or member.isdir()):
+            raise SystemExit("unsafe backup member: " + name)
+    archive.extractall(dest)
+PYEOF
+    then
+        rm -rf -- "$tmp_dir"
+        err "Небезопасный backup отклонён."
+        return 1
+    fi
+    [ -f "${tmp_dir}${CONFIG_FILE}" ] && cp -p -- "${tmp_dir}${CONFIG_FILE}" "$CONFIG_FILE"
     [ -f "${tmp_dir}${DB_FILE}" ] && cp "${tmp_dir}${DB_FILE}" "$DB_FILE"
     [ -f "${tmp_dir}${SERVICES_FILE}" ] && cp "${tmp_dir}${SERVICES_FILE}" "$SERVICES_FILE"
     [ -f "${tmp_dir}${AUDIT_FILE}" ] && cp "${tmp_dir}${AUDIT_FILE}" "$AUDIT_FILE"
