@@ -21,6 +21,7 @@ run_mtls help >/dev/null
 run_mtls config set TRAEFIK_DYNAMIC_PATH "$TMP/traefik" >/dev/null
 run_mtls config set CA_PATH "$TMP/ca" >/dev/null
 run_mtls config set CLIENTS_PATH "$TMP/clients" >/dev/null
+run_mtls ca create --cn ci-test-ca --days 30 >/dev/null
 run_mtls preset save --name ci --traefik-path "$TMP/traefik" --ca-path "$TMP/ca" --clients-path "$TMP/clients" --output-file ci.yml >/dev/null
 run_mtls preset list | grep -q '^ci '
 run_mtls preset apply --name ci >/dev/null
