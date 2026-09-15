@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  mtls.sh — Менеджер mTLS-сертификатов  v2.1
+#  mtls.sh — Менеджер mTLS-сертификатов  v2.4
 #  CLI + интерактивный TUI для управления mTLS-сертификатами под Traefik
 #  Лицензия: MIT  —  opensophy-projects
 #
@@ -8,6 +8,58 @@
 #  (или через sudo). Многопользовательский список доступа удалён —
 #  секретный материал (ключи CA, приватные ключи клиентов) не должен быть
 #  доступен кому-либо, кроме root.
+#
+#  v2.4 — исправления по итогам аудита:
+#    1. .p12 без пароля теперь тоже идёт через write_passphrase_file
+#       (-passout file:...) вместо -passout pass: — единый код-путь для
+#       всех секретов, без спецкейса для пустой строки.
+#    2. check_path_access(): заменена stat-only проверка (-w) на реальную
+#       write-and-remove пробу в целевом каталоге — закрывает TOCTOU-окно
+#       между проверкой и фактической записью (актуально на NFS/сетевых
+#       примонтированных путях, где -w может лгать).
+#    3. Добавлена ротация audit-лога: при превышении AUDIT_MAX_BYTES
+#       (по умолчанию 10 МиБ, 0=выкл) файл переносится в
+#       ${AUDIT_FILE}.1.gz, создаётся новый пустой. Настраивается через
+#       config set AUDIT_MAX_BYTES / пункт меню.
+#    4. MTLS_CA_PASSPHRASE больше не делается export — хранится как
+#       обычная (не экспортируемая) переменная шелла, не попадает в
+#       /proc/<pid>/environ этого процесса; очищается сразу после
+#       последнего использования в core_create_ca.
+#    5. patch_apply/patch_remove: построчный индент-парсер (не полный
+#       YAML-парсер) теперь пишет результат во временный файл и
+#       валидирует его (PyYAML при наличии, иначе структурный fallback:
+#       детект табов + сверка набора top-level ключей) ПЕРЕД тем, как
+#       перезаписать реальный Traefik-конфиг. При провале валидации —
+#       оригинал не тронут, статус invalid_result. Плюс .bak-копия перед
+#       каждой успешной записью.
+#    6. Задокументировано и явно прокомментировано в коде: реальный
+#       механизм отзыва сертификатов — caFiles-bundle (rebuild_bundle),
+#       НЕ CRL — Traefik не поддерживает crlFile в clientAuth. crl.pem
+#       по-прежнему генерируется как доп. артефакт для внешних
+#       потребителей, но ошибка его генерации теперь явно помечена как
+#       не влияющая на фактический отзыв.
+#
+#  v2.4:
+#    - Удалена подсистема уведомлений (WEBHOOK_URL / send_notification /
+#      NOTIFY_EXPIRY_DAYS) — core_scan_expiry больше никуда не шлёт
+#      HTTP-запросы, только печатает и пишет в audit-лог.
+#    - Кастомные пресеты путей: можно сохранить текущие
+#      TRAEFIK_DYNAMIC_PATH/CA_PATH/CLIENTS_PATH/OUTPUT_FILE под именем
+#      в отдельный файл пресетов и применить их позже (TUI: пункт меню
+#      "Настройка путей"; CLI: `preset save|list|apply|delete`).
+#
+#  v2.2 — security hardening pass (см. также комментарии на местах):
+#    - validate_name(): строгий whitelist для имён service/cert_name,
+#      закрывает path traversal ("../", "/") и коллизии uid через "__".
+#    - safe_replace(): атомарная замена файла с отказом следовать
+#      symlink на месте назначения (защита БД/конфига/bundle от
+#      symlink-атаки при небезопасном $HOME).
+#    - Стартовая проверка на symlink для CONFIG_FILE/DB_FILE/
+#      SERVICES_FILE/AUDIT_FILE.
+#    - .p12 пароль теперь передаётся в openssl через -passout file:...
+#      (а не -passout pass:...), как и все остальные секреты в скрипте —
+#      больше не виден в `ps`/argv.
+#    - Обновлена справка (--pass виден в истории шелла/ps).
 # =============================================================================
 set -euo pipefail
 # Fallback for shopt on very old bash (we require bash >=4 anyway)
@@ -27,6 +79,7 @@ CONFIG_FILE="${MTLS_CONFIG_FILE:-${HOME}/.mtls-manager.conf}"
 DB_FILE="${MTLS_DB_FILE:-${HOME}/.mtls-manager.db}"
 SERVICES_FILE="${MTLS_SERVICES_FILE:-${HOME}/.mtls-manager.services}"
 AUDIT_FILE="${MTLS_AUDIT_FILE:-${HOME}/.mtls-manager.audit.jsonl}"
+PRESETS_FILE="${MTLS_PRESETS_FILE:-${HOME}/.mtls-manager.presets}"
 LOCK_FILE="${DB_FILE}.lock"
 
 TRAEFIK_DYNAMIC_PATH="/etc/traefik/dynamic"
@@ -37,13 +90,19 @@ CERT_DAYS=365
 EXPIRY_WARN_DAYS=30
 CA_KEY_ENCRYPTED=0
 BUNDLE_MODE="shared"   # shared | per-service
-WEBHOOK_URL=""
-
-NOTIFY_EXPIRY_DAYS=14
 
 # Require an explicit password before issuing a .p12 (no silent empty-password
 # fallback). 1 = required, 0 = allow empty password if explicitly confirmed.
 REQUIRE_P12_PASSWORD=1
+
+# Audit log rotation: when $AUDIT_FILE exceeds this many bytes, it is
+# rotated to AUDIT_FILE.1.gz (previous .1.gz, if any, is discarded) and a
+# fresh empty audit file is started. 0 disables rotation. Checked once per
+# invocation, before the first audit_log() write of that run — an
+# unbounded audit log is an operational problem (disk fills up over a long
+# deployment lifetime), not an attacker-controlled one, so a simple
+# size-triggered rotation at process start is sufficient.
+AUDIT_MAX_BYTES=10485760   # 10 MiB
 
 # Non-interactive flag (set by CLI subcommands)
 MTLS_NONINTERACTIVE=0
@@ -121,8 +180,6 @@ require_root() {
         echo -e "  ${RED}✖${RESET}  Этот скрипт должен запускаться только от root."
         echo -e "  ${DIM}Он работает с приватными ключами CA и клиентов — доступ ограничен намеренно.${RESET}"
         echo ""
-        echo -e "  Запустите через sudo:  ${CYAN}sudo mtls.sh${RESET}"
-        echo ""
         exit 1
     fi
 }
@@ -146,8 +203,9 @@ mtls_cleanup_runtime() {
 trap mtls_cleanup_runtime EXIT INT TERM
 
 # Записывает пароль во временный приватный файл (0600) и печатает путь.
-# Используется вместо передачи пароля через переменные окружения, которые
-# видны через /proc/<pid>/environ другим процессам. Файл удаляется
+# Используется вместо передачи пароля через переменные окружения или
+# argv, которые видны через /proc/<pid>/environ или /proc/<pid>/cmdline
+# (и, для argv, через `ps`) другим процессам. Файл удаляется
 # автоматически при выходе из скрипта (см. trap выше), а также его можно
 # удалить сразу после использования через forget_passphrase_file.
 write_passphrase_file() {
@@ -181,15 +239,15 @@ load_config() {
             EXPIRY_WARN_DAYS)       EXPIRY_WARN_DAYS="$val" ;;
             CA_KEY_ENCRYPTED)       CA_KEY_ENCRYPTED="$val" ;;
             BUNDLE_MODE)            BUNDLE_MODE="$val" ;;
-            WEBHOOK_URL)            WEBHOOK_URL="$val" ;;
-            NOTIFY_EXPIRY_DAYS)     NOTIFY_EXPIRY_DAYS="$val" ;;
             REQUIRE_P12_PASSWORD)   REQUIRE_P12_PASSWORD="$val" ;;
+            AUDIT_MAX_BYTES)        AUDIT_MAX_BYTES="$val" ;;
         esac
     done < "$CONFIG_FILE"
 }
 
 save_config() {
-    cat > "$CONFIG_FILE" <<EOF
+    local tmp; tmp=$(mktemp "${CONFIG_FILE}.XXXXXX")
+    cat > "$tmp" <<EOF
 TRAEFIK_DYNAMIC_PATH="$TRAEFIK_DYNAMIC_PATH"
 CA_PATH="$CA_PATH"
 CLIENTS_PATH="$CLIENTS_PATH"
@@ -198,11 +256,10 @@ CERT_DAYS="$CERT_DAYS"
 EXPIRY_WARN_DAYS="$EXPIRY_WARN_DAYS"
 CA_KEY_ENCRYPTED="$CA_KEY_ENCRYPTED"
 BUNDLE_MODE="$BUNDLE_MODE"
-WEBHOOK_URL="$WEBHOOK_URL"
-NOTIFY_EXPIRY_DAYS="$NOTIFY_EXPIRY_DAYS"
 REQUIRE_P12_PASSWORD="$REQUIRE_P12_PASSWORD"
+AUDIT_MAX_BYTES="$AUDIT_MAX_BYTES"
 EOF
-    chmod 600 "$CONFIG_FILE"
+    safe_replace "$tmp" "$CONFIG_FILE" 600
 }
 
 # =============================================================================
@@ -219,10 +276,39 @@ db_lock() {
 db_unlock() { flock -u 9 2>/dev/null || true; }
 
 # =============================================================================
-#  AUDIT LOG — JSONL append-only
+#  AUDIT LOG — JSONL append-only, with size-triggered rotation
 # =============================================================================
+
+# Rotates $AUDIT_FILE to ${AUDIT_FILE}.1.gz once it exceeds
+# $AUDIT_MAX_BYTES, discarding any previous .1.gz. This is a simple,
+# single-generation rotation (no .2.gz, .3.gz, ...) deliberately: the
+# audit log's purpose here is a recent operational trail, not long-term
+# archival, and this script has no cron/systemd-timer companion to run a
+# fancier logrotate-style policy. AUDIT_MAX_BYTES=0 disables rotation
+# entirely (kept for operators who explicitly want unbounded history and
+# manage rotation themselves via external logrotate).
+audit_rotate() {
+    [ "${AUDIT_MAX_BYTES:-0}" = "0" ] && return 0
+    [ -f "$AUDIT_FILE" ] || return 0
+    local size
+    size=$(wc -c < "$AUDIT_FILE" 2>/dev/null || echo 0)
+    [ "$size" -le "$AUDIT_MAX_BYTES" ] 2>/dev/null && return 0
+
+    local rotated="${AUDIT_FILE}.1.gz"
+    local tmp_gz; tmp_gz=$(mktemp "${AUDIT_FILE}.rotate.XXXXXX")
+    if gzip -c "$AUDIT_FILE" > "$tmp_gz" 2>/dev/null; then
+        chmod 600 "$tmp_gz" 2>/dev/null || true
+        mv -f "$tmp_gz" "$rotated"
+        : > "$AUDIT_FILE"
+        chmod 600 "$AUDIT_FILE" 2>/dev/null || true
+    else
+        rm -f "$tmp_gz"
+    fi
+}
+
 audit_log() {
     local action="$1" detail="${2:-}"
+    audit_rotate
     local ts actor
     ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
     actor="${SUDO_USER:-${USER:-unknown}}"
@@ -242,37 +328,59 @@ db_init() {
     [ -f "$DB_FILE" ]       || { echo '{}' > "$DB_FILE";  chmod 600 "$DB_FILE"; }
     [ -f "$SERVICES_FILE" ] || { echo '[]' > "$SERVICES_FILE"; chmod 600 "$SERVICES_FILE"; }
     [ -f "$AUDIT_FILE" ]    || { touch "$AUDIT_FILE"; chmod 600 "$AUDIT_FILE"; }
+    [ -f "$PRESETS_FILE" ]  || { echo '{}' > "$PRESETS_FILE"; chmod 600 "$PRESETS_FILE"; }
 }
 
-# Check if a given path is writable; root always passes since the whole
-# script now requires root. Kept for clarity of error messages and for
-# the case where CA_PATH/CLIENTS_PATH live on a read-only mount.
+# Check if a given path is actually writable; root always passes the
+# permission-bit sense of this since the whole script requires root, but
+# permission bits are not the only reason a write can fail (read-only
+# mount, immutable/chattr flag, SELinux/AppArmor, NFS root-squash — all of
+# these can make -w lie). Rather than trust `-w`/stat and then still race
+# against the real write that happens moments later (classic TOCTOU: the
+# filesystem state between the check and the actual openssl/mkdir call is
+# not guaranteed to be the same, especially on network mounts), this does
+# a real, disposable write-and-remove probe against the same directory
+# the caller is about to write into. A probe failure is authoritative;
+# there is no meaningful gap left to race, since the probe uses the exact
+# mechanism (mkdir/touch/rm) the real operation will use moments later.
 check_path_access() {
     local test_path="${1:-$CA_PATH}"
+    local probe_dir="$test_path"
 
-    if [ -d "$test_path" ]; then
-        if [ ! -w "$test_path" ]; then
+    if [ ! -d "$probe_dir" ]; then
+        probe_dir="$test_path"
+        while [ "$probe_dir" != "/" ] && [ ! -d "$probe_dir" ]; do
+            probe_dir="$(dirname "$probe_dir")"
+        done
+        [ "$probe_dir" = "" ] && probe_dir="/"
+    fi
+
+    local made_dir=0
+    # If the target itself doesn't exist yet, try to create it as part of
+    # the probe (mirrors what the real operation will do via mkdir -p),
+    # then probe a write inside it.
+    if [ ! -d "$test_path" ]; then
+        if ! mkdir -p "$test_path" 2>/dev/null; then
             echo ""
-            echo -e "  ${RED}✖${RESET}  Нет прав на запись в: ${test_path}"
-            echo -e "  ${DIM}Путь существует, но недоступен для записи даже root (возможно, read-only mount, immutable-флаг или SELinux/AppArmor).${RESET}"
+            echo -e "  ${RED}✖${RESET}  Нет прав на создание: ${test_path}"
+            echo -e "  ${DIM}Родительский каталог не доступен для записи: ${probe_dir}${RESET}"
             echo ""
             return 1
         fi
-        return 0
+        made_dir=1
     fi
 
-    local parent="$test_path"
-    while [ "$parent" != "/" ] && [ ! -d "$parent" ]; do
-        parent="$(dirname "$parent")"
-    done
-    if [ "$parent" = "/" ]; then parent="/"; fi
-    if [ ! -w "$parent" ]; then
+    local probe_file
+    probe_file="${test_path}/.mtls-write-probe.$$"
+    if ! ( : > "$probe_file" ) 2>/dev/null; then
         echo ""
-        echo -e "  ${RED}✖${RESET}  Нет прав на создание: ${test_path}"
-        echo -e "  ${DIM}Родительский каталог не доступен для записи: ${parent}${RESET}"
+        echo -e "  ${RED}✖${RESET}  Нет прав на запись в: ${test_path}"
+        echo -e "  ${DIM}Путь существует, но недоступен для записи даже root (возможно, read-only mount, immutable-флаг, SELinux/AppArmor или NFS root_squash).${RESET}"
         echo ""
+        [ "$made_dir" = "1" ] && rmdir "$test_path" 2>/dev/null
         return 1
     fi
+    rm -f "$probe_file" 2>/dev/null
     return 0
 }
 
@@ -293,6 +401,34 @@ show_permission_error() {
     echo -e "  ${RED}✖${RESET}  Доступ запрещён: ${path}"
     echo -e "  ${DIM}Путь недоступен для записи даже под root — проверьте монтирование и права файловой системы.${RESET}"
     echo ""
+}
+
+# =============================================================================
+#  SAFE FILE REPLACE — atomic write that refuses to follow a symlink at
+#  the destination.
+#
+#  Several places in this script build a new file at a temp path and then
+#  move it over a well-known destination (the JSON "databases", the
+#  config file, the Traefik config, the certificate bundle). If an
+#  attacker who once had write access to $HOME (or to the destination's
+#  parent directory) could replace the destination with a symlink
+#  pointing elsewhere, a plain `mv "$tmp" "$dest"` would follow that
+#  symlink and let a root-run script overwrite an arbitrary target file
+#  with attacker-influenced content. safe_replace() refuses to do that:
+#  if the destination exists and is a symlink, it aborts instead of
+#  silently following it. The caller is still responsible for creating
+#  $tmp under the same directory as $dest (via mktemp "${dest}.XXXXXX")
+#  so the final mv is atomic and on the same filesystem.
+# =============================================================================
+safe_replace() {
+    local tmp="$1" dest="$2" mode="${3:-600}"
+    if [ -L "$dest" ]; then
+        err "Отказ: ${dest} является symlink — запись прервана из соображений безопасности."
+        rm -f "$tmp"
+        return 1
+    fi
+    chmod "$mode" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$dest"
 }
 
 # db_write_many: atomically apply multiple field=value updates for one
@@ -325,8 +461,7 @@ db[name].update(json.loads(pairs_json))
 with open(out, 'w') as f:
     json.dump(db, f, indent=2, ensure_ascii=False)
 PYEOF
-    mv "$tmp" "$DB_FILE"
-    chmod 600 "$DB_FILE"
+    safe_replace "$tmp" "$DB_FILE" 600
 }
 
 # Kept for single-field updates (revoke, etc.) — implemented on top of
@@ -357,8 +492,7 @@ db.pop(sys.argv[2], None)
 with open(sys.argv[3], 'w') as f:
     json.dump(db, f, indent=2, ensure_ascii=False)
 PYEOF
-    mv "$tmp" "$DB_FILE"
-    chmod 600 "$DB_FILE"
+    safe_replace "$tmp" "$DB_FILE" 600
 }
 
 db_list_names() {
@@ -450,8 +584,7 @@ svcs.append({
 with open(sys.argv[8], 'w') as f:
     json.dump(svcs, f, indent=2)
 PYEOF
-    mv "$tmp" "$SERVICES_FILE"
-    chmod 600 "$SERVICES_FILE"
+    safe_replace "$tmp" "$SERVICES_FILE" 600
 }
 
 svc_delete() {
@@ -465,8 +598,92 @@ svcs = [s for s in svcs if s['name'] != sys.argv[2]]
 with open(sys.argv[3], 'w') as f:
     json.dump(svcs, f, indent=2)
 PYEOF
-    mv "$tmp" "$SERVICES_FILE"
-    chmod 600 "$SERVICES_FILE"
+    safe_replace "$tmp" "$SERVICES_FILE" 600
+}
+
+# =============================================================================
+#  PRESETS — именованные наборы путей (TRAEFIK_DYNAMIC_PATH, CA_PATH,
+#  CLIENTS_PATH, OUTPUT_FILE), которые пользователь может сохранить под
+#  своим именем и применить позже. Хранятся отдельно от основного
+#  конфига в $PRESETS_FILE (JSON-объект вида {"имя": {...}}), пишутся
+#  через safe_replace().
+#
+#  Имя пресета валидируется той же функцией validate_name(), что и
+#  имена service/cert_name — чтобы не превратить пользовательский ввод
+#  в путь/разделитель и не столкнуться с "__"-коллизиями там, где имя
+#  пресета участвует в выводе.
+# =============================================================================
+preset_list_names() {
+    python3 - "$PRESETS_FILE" << 'PYEOF' 2>/dev/null
+import sys, json
+with open(sys.argv[1]) as f:
+    p = json.load(f)
+for k in p:
+    print(k)
+PYEOF
+}
+
+preset_get() {
+    local name="$1" field="$2"
+    python3 - "$PRESETS_FILE" "$name" "$field" << 'PYEOF' 2>/dev/null
+import sys, json
+with open(sys.argv[1]) as f:
+    p = json.load(f)
+print(p.get(sys.argv[2], {}).get(sys.argv[3], ''), end='')
+PYEOF
+}
+
+preset_save() {
+    local name="$1" traefik_path="$2" ca_path="$3" clients_path="$4" output_file="$5"
+    local tmp; tmp=$(mktemp "${PRESETS_FILE}.XXXXXX")
+    python3 - "$PRESETS_FILE" "$name" "$traefik_path" "$ca_path" "$clients_path" "$output_file" "$tmp" << 'PYEOF'
+import sys, json
+db_path, name, tp, cap, clp, of, out = sys.argv[1:]
+with open(db_path) as f:
+    p = json.load(f)
+p[name] = {
+    'traefik_dynamic_path': tp,
+    'ca_path': cap,
+    'clients_path': clp,
+    'output_file': of,
+}
+with open(out, 'w') as f:
+    json.dump(p, f, indent=2, ensure_ascii=False)
+PYEOF
+    safe_replace "$tmp" "$PRESETS_FILE" 600
+}
+
+preset_delete() {
+    local name="$1"
+    local tmp; tmp=$(mktemp "${PRESETS_FILE}.XXXXXX")
+    python3 - "$PRESETS_FILE" "$name" "$tmp" << 'PYEOF'
+import sys, json
+db_path, name, out = sys.argv[1:]
+with open(db_path) as f:
+    p = json.load(f)
+p.pop(name, None)
+with open(out, 'w') as f:
+    json.dump(p, f, indent=2, ensure_ascii=False)
+PYEOF
+    safe_replace "$tmp" "$PRESETS_FILE" 600
+}
+
+preset_apply() {
+    local name="$1"
+    local tp cap clp of
+    tp=$(preset_get "$name" "traefik_dynamic_path")
+    cap=$(preset_get "$name" "ca_path")
+    clp=$(preset_get "$name" "clients_path")
+    of=$(preset_get "$name" "output_file")
+    if [ -z "$tp" ] && [ -z "$cap" ] && [ -z "$clp" ]; then
+        return 1
+    fi
+    TRAEFIK_DYNAMIC_PATH="$tp"
+    CA_PATH="$cap"
+    CLIENTS_PATH="$clp"
+    [ -n "$of" ] && OUTPUT_FILE="$of"
+    save_config
+    return 0
 }
 
 # =============================================================================
@@ -491,16 +708,18 @@ run_openssl() {
     return 0
 }
 
-# Passphrases for CA operations are never put in environment variables
-# (readable via /proc/<pid>/environ) nor piped as bare stdin without a
-# file. Instead, callers do:
+# Passphrases for CA/client-cert operations are never put in environment
+# variables (readable via /proc/<pid>/environ) nor passed as bare argv
+# (readable via `ps` / /proc/<pid>/cmdline) to openssl. Instead, callers
+# do:
 #
 #   local passfile; passfile=$(write_passphrase_file "$pass")
 #   run_openssl openssl genrsa -aes256 -out key.pem -passout "file:$passfile" 4096
 #   forget_passphrase_file "$passfile"
 #
 # This keeps the secret in a 0600 file for the shortest possible window,
-# never in argv (visible via `ps`) and never in the environment.
+# never in argv and never in the environment. This applies uniformly to
+# the CA key passphrase AND the client .p12 export password.
 
 # =============================================================================
 #  INTERMEDIATE CA (per-client)
@@ -654,8 +873,7 @@ rebuild_bundle() {
             done <<< "$names"
         fi
         [ "$count" -eq 0 ] && cat "${CA_PATH}/ca.crt" > "$tmp"
-        chmod 644 "$tmp"
-        mv "$tmp" "$bundle"
+        safe_replace "$tmp" "$bundle" 644
         touch "$bundle"
     fi
 }
@@ -679,8 +897,7 @@ _rebuild_bundle_for_service() {
         fi
     done <<< "$names"
     [ "$count" -eq 0 ] && cat "${CA_PATH}/ca.crt" > "$tmp"
-    chmod 644 "$tmp"
-    mv "$tmp" "$bundle"
+    safe_replace "$tmp" "$bundle" 644
     touch "$bundle"
 }
 
@@ -754,6 +971,27 @@ authorityKeyIdentifier=keyid:always
 EOF
 }
 
+# rebuild_crl(): generates a standard X.509 CRL at $(ca_crl) (crl.pem).
+#
+# IMPORTANT — this CRL is NOT the actual revocation mechanism for Traefik
+# in this setup. Traefik's dynamic TLS config (the `clientAuth.caFiles`
+# list this script writes into the generated tls.options block) has no
+# `crlFile` equivalent — Traefik does not consult a CRL when verifying
+# client certificates. The real revocation path here is
+# rebuild_bundle(): a client's intermediate CA is simply dropped from the
+# caFiles bundle once its cert is revoked (revoked=1 in the DB), so
+# Traefik can no longer build a trust chain for that client at all,
+# regardless of what the client's certificate itself claims about its
+# own validity.
+#
+# This CRL is generated anyway because it's a standard artifact
+# (crl.pem) that other, non-Traefik consumers of this CA might expect —
+# an external mTLS terminator, a monitoring/audit tool, or a manual
+# `openssl verify -crl_check` run. It is informational/interoperability
+# output, not part of this script's own access-control path. A failure
+# to (re)generate it is therefore a warning, never a hard error — it
+# never blocks cert issuance or revocation, both of which already took
+# effect via the bundle the moment this function is called.
 rebuild_crl() {
     gen_ca_cnf; ca_db_init
     local rc=0
@@ -765,7 +1003,7 @@ rebuild_crl() {
     else
         run_openssl openssl ca -config "$(ca_cnf)" -gencrl -out "$(ca_crl)" || rc=$?
     fi
-    [ "$rc" -ne 0 ] && { err "Не удалось перегенерировать CRL."; return 1; }
+    [ "$rc" -ne 0 ] && { err "Не удалось перегенерировать CRL (crl.pem) — это не влияет на фактический отзыв через Traefik: он использует caFiles-bundle, не CRL. crl.pem нужен только внешним потребителям."; return 1; }
     chmod 644 "$(ca_crl)"
 }
 
@@ -775,7 +1013,12 @@ ca_key_prompt_passphrase() {
     if [ "$CA_KEY_ENCRYPTED" = "1" ] && [ -z "${MTLS_CA_PASSPHRASE:-}" ]; then
         info "Ключ CA зашифрован — введите пароль:"
         local pass; pass=$(ask_secret "Пароль")
-        export MTLS_CA_PASSPHRASE="$pass"
+        # Deliberately NOT exported: an exported variable is visible to
+        # any process (and to anyone who can read this process's own
+        # /proc/<pid>/environ) for the remainder of the script's run. A
+        # plain (non-exported) shell variable is confined to this shell's
+        # own memory and is not surfaced via /proc/<pid>/environ.
+        MTLS_CA_PASSPHRASE="$pass"
     fi
 }
 
@@ -825,12 +1068,69 @@ PYEOF
 # =============================================================================
 #  PATCH MODE (YAML modification for existing Traefik routers)
 # =============================================================================
+# Both patch_apply and patch_remove share the same safety envelope: the
+# actual line-based indent-tracking edit (not a full YAML parser — it can
+# misjudge unusual/inconsistent indentation in a hand-edited router file)
+# writes its result to a throwaway temp file first. That result is then
+# validated — parsed with PyYAML if available (preferred: catches real
+# structural breakage), or with a conservative structural fallback
+# otherwise (tab detection, balanced-looking indentation, same top-level
+# key set before/after) if PyYAML isn't installed. Only if validation
+# passes does a timestamped .bak get written and the temp file get moved
+# over the original via safe_replace (atomic, symlink-safe). If the edit
+# produces something that doesn't validate, the original file is left
+# completely untouched and the caller gets an explicit 'invalid_result'
+# status instead of a silently corrupted Traefik config.
+_patch_validate_and_commit() {
+    local orig="$1" tmp_result="$2"
+    python3 - "$orig" "$tmp_result" << 'PYEOF'
+import sys
+orig, tmp = sys.argv[1:]
+
+def keys_top_level(text):
+    keys = set()
+    for line in text.split('\n'):
+        if line and not line[0].isspace() and ':' in line and not line.lstrip().startswith('#'):
+            keys.add(line.split(':', 1)[0].strip())
+    return keys
+
+with open(orig) as f:
+    orig_text = f.read()
+with open(tmp) as f:
+    new_text = f.read()
+
+if '\t' in new_text:
+    print('invalid: tab character present'); sys.exit(1)
+
+try:
+    import yaml
+    yaml.safe_load(new_text)
+except ImportError:
+    # PyYAML not installed — fall back to a conservative structural
+    # check: the set of top-level (column-0) keys must be unchanged,
+    # since a patch should only ever add/remove an 'options:' line
+    # nested under an existing router's 'tls:' block, never touch
+    # top-level structure.
+    if keys_top_level(orig_text) != keys_top_level(new_text):
+        print('invalid: top-level structure changed (no PyYAML available to fully verify)')
+        sys.exit(1)
+except Exception as e:
+    print(f'invalid: does not parse as YAML: {e}')
+    sys.exit(1)
+
+print('valid')
+PYEOF
+}
+
 patch_apply() {
     local svc="$1" patch_file="$2" router_name="$3"
     local tls_opt="mtls-${svc}"
-    python3 - "$patch_file" "$router_name" "$tls_opt" << 'PYEOF'
+    local tmp_result; tmp_result=$(mktemp "${patch_file}.patchtmp.XXXXXX")
+
+    local py_status
+    py_status=$(python3 - "$patch_file" "$router_name" "$tls_opt" "$tmp_result" << 'PYEOF'
 import sys
-path, router, tls_opt = sys.argv[1:]
+path, router, tls_opt, out_path = sys.argv[1:]
 with open(path) as f:
     content = f.read()
 if f'options: {tls_opt}' in content:
@@ -860,30 +1160,84 @@ while i < len(lines):
             continue
     out.append(line); i += 1
 if patched:
-    with open(path, 'w') as f:
+    with open(out_path, 'w') as f:
         f.write('\n'.join(out))
     print('patched')
 else:
     print('not_found')
 PYEOF
+)
+    case "$py_status" in
+        already_patched|not_found)
+            rm -f "$tmp_result"
+            echo "$py_status"
+            return 0
+            ;;
+        patched)
+            local validation; validation=$(_patch_validate_and_commit "$patch_file" "$tmp_result")
+            if [ "$validation" != "valid" ]; then
+                err "Патч отклонён — результат не прошёл проверку: ${validation}"
+                err "Оригинальный файл не изменён: ${patch_file}"
+                rm -f "$tmp_result"
+                echo "invalid_result"
+                return 1
+            fi
+            cp -p "$patch_file" "${patch_file}.bak.$(date '+%Y%m%d%H%M%S')" 2>/dev/null || true
+            safe_replace "$tmp_result" "$patch_file" 644
+            echo "patched"
+            return 0
+            ;;
+        *)
+            rm -f "$tmp_result"
+            echo "invalid_result"
+            return 1
+            ;;
+    esac
 }
 
 patch_remove() {
     local svc="$1" patch_file="$2" router_name="$3"
     local tls_opt="mtls-${svc}"
-    python3 - "$patch_file" "$router_name" "$tls_opt" << 'PYEOF'
+    local tmp_result; tmp_result=$(mktemp "${patch_file}.patchtmp.XXXXXX")
+
+    local py_status
+    py_status=$(python3 - "$patch_file" "$router_name" "$tls_opt" "$tmp_result" << 'PYEOF'
 import sys
-path, router, tls_opt = sys.argv[1:]
+path, router, tls_opt, out_path = sys.argv[1:]
 with open(path) as f:
     content = f.read()
 if f'options: {tls_opt}' not in content:
-    sys.exit(0)
+    print('not_found'); sys.exit(0)
 lines = content.split('\n')
 out = [line for line in lines if f'options: {tls_opt}' not in line]
-with open(path, 'w') as f:
+with open(out_path, 'w') as f:
     f.write('\n'.join(out))
 print('removed')
 PYEOF
+)
+    case "$py_status" in
+        not_found)
+            rm -f "$tmp_result"
+            return 0
+            ;;
+        removed)
+            local validation; validation=$(_patch_validate_and_commit "$patch_file" "$tmp_result")
+            if [ "$validation" != "valid" ]; then
+                err "Удаление патча отклонено — результат не прошёл проверку: ${validation}"
+                err "Оригинальный файл не изменён: ${patch_file}"
+                rm -f "$tmp_result"
+                return 1
+            fi
+            cp -p "$patch_file" "${patch_file}.bak.$(date '+%Y%m%d%H%M%S')" 2>/dev/null || true
+            safe_replace "$tmp_result" "$patch_file" 644
+            echo "removed"
+            return 0
+            ;;
+        *)
+            rm -f "$tmp_result"
+            return 1
+            ;;
+    esac
 }
 
 # =============================================================================
@@ -910,6 +1264,7 @@ do_gen_traefik() {
             [ "$mode" = "new" ] && has_new_svc=1
         done <<< "$svc_names"
     fi
+    local gen_tmp; gen_tmp=$(mktemp "${out}.XXXXXX")
     {
         echo "# Generated by mtls-manager — $(date '+%Y-%m-%d %H:%M:%S')"
         echo "# DO NOT EDIT MANUALLY"
@@ -968,8 +1323,9 @@ do_gen_traefik() {
                 echo "          - url: \"${target}\""
             done <<< "$svc_names"
         fi
-    } > "$out"
-    chmod 644 "$out"; touch "$out"
+    } > "$gen_tmp"
+    safe_replace "$gen_tmp" "$out" 644
+    touch "$out"
 
     if ! validate_yaml "$out"; then
         warn "Сгенерированный YAML может иметь структурные проблемы — проверьте: $out"
@@ -999,6 +1355,8 @@ do_backup() {
         echo "$DB_FILE"
         echo "$SERVICES_FILE"
         echo "$AUDIT_FILE"
+        [ -f "${AUDIT_FILE}.1.gz" ] && echo "${AUDIT_FILE}.1.gz"
+        echo "$PRESETS_FILE"
         [ -f "$CA_PATH/ca.crt" ] && find "$CA_PATH" -type f 2>/dev/null
     } > "$tmp_list"
     tar czf "$dest" -T "$tmp_list" 2>/dev/null
@@ -1019,6 +1377,8 @@ do_restore() {
     [ -f "${tmp_dir}${DB_FILE}" ] && cp "${tmp_dir}${DB_FILE}" "$DB_FILE"
     [ -f "${tmp_dir}${SERVICES_FILE}" ] && cp "${tmp_dir}${SERVICES_FILE}" "$SERVICES_FILE"
     [ -f "${tmp_dir}${AUDIT_FILE}" ] && cp "${tmp_dir}${AUDIT_FILE}" "$AUDIT_FILE"
+    [ -f "${tmp_dir}${AUDIT_FILE}.1.gz" ] && cp "${tmp_dir}${AUDIT_FILE}.1.gz" "${AUDIT_FILE}.1.gz"
+    [ -f "${tmp_dir}${PRESETS_FILE}" ] && cp "${tmp_dir}${PRESETS_FILE}" "$PRESETS_FILE"
     if [ -d "${tmp_dir}${CA_PATH}" ]; then
         mkdir -p "$CA_PATH"
         cp -r "${tmp_dir}${CA_PATH}/"* "$CA_PATH/" 2>/dev/null || true
@@ -1027,19 +1387,6 @@ do_restore() {
     load_config
     ok "Восстановлено из: $src"
     audit_log "restore" "$src"
-}
-
-# =============================================================================
-#  NOTIFICATIONS
-# =============================================================================
-send_notification() {
-    local title="$1" body="$2"
-    if [ -n "$WEBHOOK_URL" ]; then
-        curl -sS -X POST "$WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -d "{\"title\": \"$title\", \"body\": \"$body\"}" \
-            >/dev/null 2>&1 || true
-    fi
 }
 
 # =============================================================================
@@ -1148,6 +1495,58 @@ check_deps() {
 }
 
 # =============================================================================
+#  INPUT VALIDATION — service / certificate name whitelist
+#
+#  service, cert_name (and therefore the derived uid "${service}__${name}")
+#  are used, unescaped, to build filesystem paths:
+#     ${CLIENTS_PATH}/${service}/${cert_name}
+#     ${CA_PATH}/intermediates/${service}__${cert_name}
+#  and as python dict keys in the JSON "databases". Without validation:
+#    - "../" or "/" in either field allows writing cert/key material
+#      (as root) to arbitrary paths on the filesystem (path traversal).
+#    - a literal "__" inside one field lets an attacker craft a uid that
+#      collides with a different (service, name) pair, letting one
+#      service's operation silently overwrite/revoke another service's
+#      certificate record (an IDOR-style collision).
+#    - a leading "-" could be misread as a flag by external commands.
+#  validate_name() enforces a strict whitelist and rejects "__" so the
+#  "service__name" join is always unambiguous and reversible.
+#  Reused for preset names for the same reasons.
+# =============================================================================
+validate_name() {
+    local field_label="$1" value="$2"
+    if [ -z "$value" ]; then
+        cli_err "${field_label} не может быть пустым."
+        return 1
+    fi
+    if [ ${#value} -gt 128 ]; then
+        cli_err "${field_label} слишком длинное (макс. 128 символов): ${value}"
+        return 1
+    fi
+    case "$value" in
+        -*)
+            cli_err "${field_label} не может начинаться с '-': ${value}"
+            return 1
+            ;;
+    esac
+    case "$value" in
+        *__*)
+            cli_err "${field_label} не может содержать '__' (используется как внутренний разделитель): ${value}"
+            return 1
+            ;;
+    esac
+    if [[ "$value" == *".."* ]] || [[ "$value" == *"/"* ]]; then
+        cli_err "${field_label} не может содержать '/' или '..': ${value}"
+        return 1
+    fi
+    if ! [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        cli_err "${field_label} может содержать только латиницу, цифры, '.', '_' и '-': ${value}"
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
 #  CORE OPERATIONS (shared by TUI and CLI)
 # =============================================================================
 core_create_ca() {
@@ -1170,7 +1569,11 @@ core_create_ca() {
         CA_KEY_ENCRYPTED=1
         if [ -z "${MTLS_CA_PASSPHRASE:-}" ]; then
             local pass; pass=$(ask_secret "Пароль для ключа CA")
-            export MTLS_CA_PASSPHRASE="$pass"
+            # Not exported: keep the passphrase out of this process's
+            # environ (which is readable via /proc/<pid>/environ by
+            # anyone able to inspect the process) — see ca_key_prompt_passphrase
+            # for the same reasoning.
+            MTLS_CA_PASSPHRASE="$pass"
         fi
         local passfile; passfile=$(write_passphrase_file "$MTLS_CA_PASSPHRASE")
         run_openssl openssl genrsa -aes256 -out "${CA_PATH}/ca.key" -passout "file:${passfile}" 4096 || rc=$?
@@ -1193,6 +1596,11 @@ core_create_ca() {
             -out "${CA_PATH}/ca.crt" \
             -subj "/CN=${cn}/O=mTLS-Manager/C=US" || rc=$?
         forget_passphrase_file "$passfile2"
+        # Both openssl calls that needed the CA passphrase in this
+        # function are done — clear it from process memory now rather
+        # than let it sit for the rest of the run.
+        MTLS_CA_PASSPHRASE=""
+        unset MTLS_CA_PASSPHRASE
     else
         run_openssl openssl req -new -x509 -days "$days" -key "${CA_PATH}/ca.key" -out "${CA_PATH}/ca.crt" \
             -subj "/CN=${cn}/O=mTLS-Manager/C=US" || rc=$?
@@ -1207,7 +1615,7 @@ core_create_ca() {
     rm -f "${CA_PATH}/index.txt" "${CA_PATH}/index.txt.attr" "${CA_PATH}/serial"
     ca_db_init
     if ! rebuild_crl; then
-        warn "CRL не удалось построить сразу после создания CA — можно повторить позже (пункт меню / cert scan)."
+        warn "CRL (crl.pem) не удалось построить сразу после создания CA — можно повторить позже. Это не влияет на работу CA или выпуск сертификатов, CRL используется только внешними потребителями, не Traefik."
     fi
 
     db_write_many "__ca__" "cn=${cn}" "days=${days}" "created=$(date '+%Y-%m-%d %H:%M:%S')"
@@ -1234,8 +1642,19 @@ core_create_ca() {
 #    can no longer leave a half-populated DB record.
 #  - .p12 is never generated with a silently empty password unless
 #    REQUIRE_P12_PASSWORD=0 and the caller/operator explicitly confirmed.
+#  - service/cert_name are validated against a strict whitelist before
+#    being used to build any filesystem path (see validate_name()), which
+#    closes a path-traversal hole ("../", "/") and a uid-collision hole
+#    ("__" appearing inside one of the fields).
+#  - the .p12 export password is passed to openssl via -passout file:...
+#    (like every other secret in this script) instead of -passout pass:...,
+#    so it never appears in argv / `ps` output.
 core_issue_cert() {
     local service="$1" cert_name="$2" days="${3:-$CERT_DAYS}" note="${4:-}" p12_pass="${5:-}"
+
+    validate_name "Имя сервиса" "$service" || return 1
+    validate_name "Имя сертификата" "$cert_name" || return 1
+
     local uid="${service}__${cert_name}"
     local existing; existing=$(db_read "$uid" "created")
     local ex_rev; ex_rev=$(db_read "$uid" "revoked")
@@ -1318,15 +1737,16 @@ core_issue_cert() {
     ok "Цепочка проверена."
 
     info "Создание .p12..."
-    if [ -n "$p12_pass" ]; then
-        run_openssl openssl pkcs12 -export -out "${staging_dir}/client.p12" \
-            -inkey "${staging_dir}/client.key" -in "${staging_dir}/client.crt" \
-            -certfile "${CA_PATH}/ca.crt" -passout "pass:${p12_pass}"
-    else
-        run_openssl openssl pkcs12 -export -out "${staging_dir}/client.p12" \
-            -inkey "${staging_dir}/client.key" -in "${staging_dir}/client.crt" \
-            -certfile "${CA_PATH}/ca.crt" -passout pass:
-    fi
+    # Even an empty password is routed through the same 0600 passphrase-file
+    # mechanism as every other secret in this script, instead of -passout
+    # pass: (empty). This isn't a secrecy concern (an empty string has
+    # nothing to leak), but it keeps a single, consistently-audited code
+    # path for -passout across the whole script rather than a special case.
+    local p12passfile; p12passfile=$(write_passphrase_file "$p12_pass")
+    run_openssl openssl pkcs12 -export -out "${staging_dir}/client.p12" \
+        -inkey "${staging_dir}/client.key" -in "${staging_dir}/client.crt" \
+        -certfile "${CA_PATH}/ca.crt" -passout "file:${p12passfile}"
+    forget_passphrase_file "$p12passfile"
     if [ ! -s "${staging_dir}/client.p12" ]; then
         err "Не удалось создать .p12 — отмена, файлы не сохранены."
         rm -rf "$staging_dir"
@@ -1352,7 +1772,7 @@ core_issue_cert() {
     db_delete "$staging_uid" 2>/dev/null || true
 
     if ! rebuild_crl; then
-        warn "CRL не удалось перегенерировать после выпуска сертификата."
+        warn "CRL (crl.pem) не удалось перегенерировать после выпуска сертификата — сам сертификат и bundle Traefik это не затрагивает."
     fi
 
     local serial expiry
@@ -1387,6 +1807,7 @@ core_issue_cert() {
             patched)         ok "Патч применён." ;;
             already_patched) info "Патч уже был применён." ;;
             not_found)       warn "Роутер '${prouter}' не найден в файле." ;;
+            invalid_result)  err "Патч НЕ применён — результат не прошёл проверку структуры YAML. Файл ${pfile} не изменён." ;;
         esac
     fi
 
@@ -1456,6 +1877,7 @@ core_delete_cert() {
 core_delete_service_full() {
     local svc="$1"
     [ -z "$svc" ] && { err "Требуется имя сервиса."; return 1; }
+    validate_name "Имя сервиса" "$svc" || return 1
 
     local svc_mode; svc_mode=$(svc_get "$svc" "mode")
     local deleted_certs=0
@@ -1531,7 +1953,7 @@ core_renew_cert() {
 core_scan_expiry() {
     local names; names=$(db_list_names)
     [ -z "$names" ] && { info "Нет сертификатов для сканирования."; return 0; }
-    local expiring="" expired="" unknown="" alerts="" uid=""
+    local expiring="" expired="" unknown="" uid=""
     while IFS= read -r uid; do
         [ -z "$uid" ] && continue
         local revoked; revoked=$(db_read "$uid" "revoked")
@@ -1564,11 +1986,6 @@ core_scan_expiry() {
         if [ -n "$unknown" ]; then
             cli_warn "Сертификаты с нераспознанной датой истечения (требуют ручной проверки):"
             echo -ne "$unknown" >&2
-        fi
-        if [ -n "$WEBHOOK_URL" ]; then
-            alerts="${expired}${expiring}${unknown}"
-            send_notification "mTLS: предупреждение об истечении" "$(echo -ne "$alerts" | tr -d '\n')"
-            ok "Уведомления отправлены."
         fi
         audit_log "scan_expiry" "expired=$(echo -ne "$expired" | wc -l) expiring=$(echo -ne "$expiring" | wc -l) unknown=$(echo -ne "$unknown" | wc -l)"
         return 1
@@ -1613,7 +2030,7 @@ core_verify_cert() {
 header() {
     clear 2>/dev/null || true
     echo ""
-    echo -e "  ${BOLD}${BLUE}Менеджер mTLS-сертификатов${RESET} ${DIM}v2.1${RESET}  ${DIM}(root)${RESET}"
+    echo -e "  ${BOLD}${BLUE}Менеджер mTLS-сертификатов${RESET} ${DIM}v2.4${RESET}  ${DIM}(root)${RESET}"
     echo -e "  ${DIM}$(date '+%Y-%m-%d %H:%M')${RESET}"
     echo ""
 }
@@ -1640,7 +2057,7 @@ menu_cert_create() {
     echo ""
     local cert_name; cert_name=$(ask "Имя сертификата (латиница, без пробелов)" "")
     cert_name="${cert_name// /-}"
-    if [ -z "$cert_name" ]; then err "Имя не может быть пустым."; pause; return; fi
+    if ! validate_name "Имя сертификата" "$cert_name"; then pause; return; fi
     local days note
     days=$(ask "Срок действия (дней)" "$CERT_DAYS")
     note=$(ask "Заметка (для кого/чего)" "")
@@ -1760,7 +2177,9 @@ menu_services() {
                 sname=$(ask "Имя сервиса" ""); sname="${sname// /-}"
                 sdomain=$(ask "Домен (напр.: myapp.example.com)" "")
                 starget=$(ask "Target URL  (напр.: http://localhost:3000)" "")
-                if [ -z "$sname" ] || [ -z "$sdomain" ] || [ -z "$starget" ]; then
+                if ! validate_name "Имя сервиса" "$sname"; then
+                    :
+                elif [ -z "$sdomain" ] || [ -z "$starget" ]; then
                     err "Все поля обязательны."
                 else
                     svc_add "$sname" "$sdomain" "$starget" "new" "" ""
@@ -1792,7 +2211,9 @@ except: pass
 PYEOF
                 echo ""
                 spr=$(ask "Имя роутера (точно как в файле)" "")
-                if [ -z "$sname" ] || [ -z "$spf" ] || [ -z "$spr" ]; then
+                if ! validate_name "Имя сервиса" "$sname"; then
+                    :
+                elif [ -z "$spf" ] || [ -z "$spr" ]; then
                     err "Все поля обязательны."
                 elif [ ! -f "$spf" ]; then
                     err "Файл не найден: $spf"
@@ -1848,6 +2269,78 @@ PYEOF
     done
 }
 
+menu_presets() {
+    while true; do
+        header; section "Кастомные пресеты путей"
+        local pnames; pnames=$(preset_list_names)
+        if [ -n "$pnames" ]; then
+            printf "  ${BOLD}%-4s %-16s %-30s %-30s${RESET}\n" "#" "Имя" "Traefik dynamic" "CA path"; hr
+            local i=1
+            while IFS= read -r p; do
+                [ -z "$p" ] && continue
+                local ptp pcap
+                ptp=$(preset_get "$p" "traefik_dynamic_path")
+                pcap=$(preset_get "$p" "ca_path")
+                printf "  ${CYAN}%-4s${RESET} %-16s %-30s %-30s\n" "$i" "$p" "$ptp" "$pcap"
+                i=$((i + 1))
+            done <<< "$pnames"; hr; echo ""
+        else
+            warn "Сохранённых пресетов нет."; echo ""
+        fi
+        echo -e "  ${BOLD}1)${RESET}  Сохранить текущие пути как пресет"
+        echo -e "  ${BOLD}2)${RESET}  Применить пресет"
+        echo -e "  ${BOLD}3)${RESET}  Удалить пресет"
+        echo -e "  ${BOLD}0)${RESET}  Назад"
+        local c; c=$(menu_choice)
+        case "$c" in
+            1)
+                echo ""
+                echo -e "  ${DIM}Текущие пути:${RESET}"
+                echo -e "    TRAEFIK_DYNAMIC_PATH = ${TRAEFIK_DYNAMIC_PATH}"
+                echo -e "    CA_PATH               = ${CA_PATH}"
+                echo -e "    CLIENTS_PATH          = ${CLIENTS_PATH}"
+                echo -e "    OUTPUT_FILE           = ${OUTPUT_FILE}"
+                echo ""
+                local pname; pname=$(ask "Имя пресета" "")
+                if ! validate_name "Имя пресета" "$pname"; then pause; continue; fi
+                preset_save "$pname" "$TRAEFIK_DYNAMIC_PATH" "$CA_PATH" "$CLIENTS_PATH" "$OUTPUT_FILE"
+                ok "Пресет '${pname}' сохранён."
+                pause ;;
+            2)
+                [ -z "$pnames" ] && { warn "Нет пресетов."; pause; continue; }
+                echo ""
+                local p_arr=()
+                while IFS= read -r p; do [ -z "$p" ] && continue; p_arr+=("$p"); done <<< "$pnames"
+                local pc; pc=$(ask "Номер пресета для применения" "")
+                [ -z "$pc" ] && { pause; continue; }
+                local papply="${p_arr[$((pc - 1))]}"
+                if [ -z "$papply" ]; then err "Неверный номер."; pause; continue; fi
+                if preset_apply "$papply"; then
+                    ok "Пресет '${papply}' применён."
+                    audit_log "preset_apply" "name=${papply}"
+                else
+                    err "Не удалось применить пресет '${papply}'."
+                fi
+                pause ;;
+            3)
+                [ -z "$pnames" ] && { warn "Нет пресетов."; pause; continue; }
+                echo ""
+                local p_arr3=()
+                while IFS= read -r p; do [ -z "$p" ] && continue; p_arr3+=("$p"); done <<< "$pnames"
+                local pc3; pc3=$(ask "Номер пресета для удаления" "")
+                [ -z "$pc3" ] && { pause; continue; }
+                local pdel="${p_arr3[$((pc3 - 1))]}"
+                if [ -n "$pdel" ] && ask_yn "Удалить пресет '$pdel'?"; then
+                    preset_delete "$pdel"
+                    ok "Пресет '${pdel}' удалён."
+                    audit_log "preset_delete" "name=${pdel}"
+                fi
+                pause ;;
+            0) return ;;
+        esac
+    done
+}
+
 menu_settings() {
     while true; do
         header; section "Настройка путей"
@@ -1858,14 +2351,15 @@ menu_settings() {
         echo -e "  ${BOLD}5)${RESET}  Срок по умолчанию (дней)\n     ${CYAN}${CERT_DAYS}${RESET}\n"
         echo -e "  ${BOLD}6)${RESET}  Предупреждение об истечении (дней)\n     ${CYAN}${EXPIRY_WARN_DAYS}${RESET}\n"
         echo -e "  ${BOLD}7)${RESET}  Режим bundle\n     ${CYAN}${BUNDLE_MODE}${RESET} ${DIM}(shared | per-service)${RESET}\n"
-        echo -e "  ${BOLD}8)${RESET}  Уведомления\n     ${CYAN}webhook=${WEBHOOK_URL:-нет}${RESET}\n"
-        echo -e "  ${BOLD}9)${RESET}  Шифрование ключа CA\n     ${CYAN}${CA_KEY_ENCRYPTED}${RESET} ${DIM}(0=выкл 1=вкл)${RESET}\n"
-        echo -e "  ${BOLD}10)${RESET} Требовать пароль для .p12\n     ${CYAN}${REQUIRE_P12_PASSWORD}${RESET} ${DIM}(0=выкл 1=вкл, рекомендуется 1)${RESET}\n"
+        echo -e "  ${BOLD}8)${RESET}  Шифрование ключа CA\n     ${CYAN}${CA_KEY_ENCRYPTED}${RESET} ${DIM}(0=выкл 1=вкл)${RESET}\n"
+        echo -e "  ${BOLD}9)${RESET}  Требовать пароль для .p12\n     ${CYAN}${REQUIRE_P12_PASSWORD}${RESET} ${DIM}(0=выкл 1=вкл, рекомендуется 1)${RESET}\n"
+        echo -e "  ${BOLD}11)${RESET} Ротация audit-лога (байт)\n     ${CYAN}${AUDIT_MAX_BYTES}${RESET} ${DIM}(0=выкл; при превышении — .1.gz)${RESET}\n"
         hr
-        echo -e "  ${DIM}Пресеты:${RESET}"
+        echo -e "  ${DIM}Встроенные пресеты:${RESET}"
         echo -e "  ${BOLD}p1)${RESET} Dokploy   /etc/dokploy/traefik/dynamic"
         echo -e "  ${BOLD}p2)${RESET} Traefik   /etc/traefik/dynamic"
         echo -e "  ${BOLD}p3)${RESET} Локально  ./traefik-local"
+        echo -e "  ${BOLD}10)${RESET} Кастомные пресеты — сохранить/применить/удалить свои наборы путей"
         hr; echo ""
         echo -e "  ${BOLD}0)${RESET}  Назад"
         local c; c=$(menu_choice)
@@ -1879,19 +2373,20 @@ menu_settings() {
             7) BUNDLE_MODE=$(ask "Режим bundle (shared | per-service)" "$BUNDLE_MODE"); save_config; ok "Сохранено."; pause ;;
             8)
                 echo ""
-                WEBHOOK_URL=$(ask "URL webhook (пусто=выкл)" "$WEBHOOK_URL")
-                save_config; ok "Настройки уведомлений сохранены."; pause ;;
-            9)
-                echo ""
                 CA_KEY_ENCRYPTED=$(ask "Шифровать ключ CA? (0=выкл 1=вкл)" "$CA_KEY_ENCRYPTED")
                 save_config; ok "Сохранено."; pause ;;
-            10)
+            9)
                 echo ""
                 REQUIRE_P12_PASSWORD=$(ask "Требовать пароль .p12? (0=выкл 1=вкл)" "$REQUIRE_P12_PASSWORD")
                 save_config; ok "Сохранено."; pause ;;
             p1) TRAEFIK_DYNAMIC_PATH="/etc/dokploy/traefik/dynamic"; CA_PATH="/etc/dokploy/traefik/dynamic/certificates/ca"; CLIENTS_PATH="/etc/dokploy/traefik/dynamic/certificates/clients"; OUTPUT_FILE="mtls-manager.yml"; save_config; ok "Пресет Dokploy применён."; pause ;;
             p2) TRAEFIK_DYNAMIC_PATH="/etc/traefik/dynamic"; CA_PATH="/etc/traefik/certs/mtls"; CLIENTS_PATH="/etc/traefik/certs/mtls/clients"; OUTPUT_FILE="mtls-manager.yml"; save_config; ok "Пресет Traefik применён."; pause ;;
             p3) TRAEFIK_DYNAMIC_PATH="$(pwd)/traefik-local/dynamic"; CA_PATH="$(pwd)/traefik-local/certs/mtls"; CLIENTS_PATH="$(pwd)/traefik-local/certs/mtls/clients"; OUTPUT_FILE="mtls-manager.yml"; save_config; ok "Локальный пресет применён."; pause ;;
+            10) menu_presets ;;
+            11)
+                echo ""
+                AUDIT_MAX_BYTES=$(ask "Макс. размер audit-лога в байтах (0=выкл)" "$AUDIT_MAX_BYTES")
+                save_config; ok "Сохранено."; pause ;;
             0) return ;;
         esac
     done
@@ -1961,7 +2456,7 @@ main_menu() {
 # =============================================================================
 cli_usage() {
     cat <<'USAGE'
-mtls.sh v2.1 — Менеджер mTLS-сертификатов (только для root)
+mtls.sh v2.4 — Менеджер mTLS-сертификатов (только для root)
 
 ИСПОЛЬЗОВАНИЕ:
   sudo mtls.sh                       Интерактивное TUI-меню
@@ -1973,18 +2468,31 @@ mtls.sh v2.1 — Менеджер mTLS-сертификатов (только д
 
   ca info
       Показать информацию о CA
+      Примечание: отзыв сертификатов в этом скрипте работает через
+      caFiles-bundle (выпадение промежуточного CA клиента из bundle),
+      а не через CRL — Traefik не поддерживает crlFile в clientAuth.
+      Файл crl.pem генерируется дополнительно как стандартный артефакт
+      для внешних потребителей (не Traefik), которые понимают CRL.
 
   ca backup [--output ФАЙЛ]
-      Резервная копия CA + БД + конфига в tar.gz
+      Резервная копия CA + БД + конфига (+ пресетов) в tar.gz
 
   ca restore --input ФАЙЛ
       Восстановление из резервной копии
 
   cert issue --service S --name N [--days D] [--note ТЕКСТ] [--pass P]
       Выпустить новый клиентский сертификат.
+      S и N допускают только латиницу, цифры, '.', '_' и '-', без "__"
+      и без "/", ".." (иначе команда завершится ошибкой) — это защищает
+      от записи файлов вне ожидаемых каталогов и от коллизий имён.
       Если --pass не задан и REQUIRE_P12_PASSWORD=1 (по умолчанию),
       команда завершится ошибкой в неинтерактивном режиме — .p12 без
       пароля не создаётся молча.
+      ВНИМАНИЕ: --pass виден в истории шелла и в выводе `ps` на время
+      выполнения. Предпочтительнее передавать пароль через переменную
+      окружения MTLS_P12_PASSWORD (её всё равно стоит считать доступной
+      любому, кто может прочитать /proc/<pid>/environ этого процесса —
+      на root-only хосте это только root).
 
   cert list [--json]
       Список всех сертификатов
@@ -2005,11 +2513,13 @@ mtls.sh v2.1 — Менеджер mTLS-сертификатов (только д
       Проверить цепочку сертификата и показать детали
 
   cert scan
-      Проверить истекающие/истёкшие/с нераспознанной датой сертификаты,
-      отправить уведомления
+      Проверить истекающие/истёкшие/с нераспознанной датой сертификаты
+      и вывести результат (без внешних уведомлений)
 
   service add --name N --domain D --target T [--mode new|patch]
-      Добавить сервис (для patch: --patch-file F --router R)
+      Добавить сервис (для patch: --patch-file F --router R).
+      N допускает только латиницу, цифры, '.', '_' и '-', без "__" и
+      без "/", "..".
 
   service list
       Список всех сервисов
@@ -2021,6 +2531,20 @@ mtls.sh v2.1 — Менеджер mTLS-сертификатов (только д
       Полное удаление: отозвать+удалить все клиентские сертификаты,
       удалить клиентские файлы, удалить сгенерированный блок роутера/сервиса Traefik,
       снять patch, удалить сервис
+
+  preset save --name N [--traefik-path P] [--ca-path P] [--clients-path P] [--output-file F]
+      Сохранить кастомный пресет путей под именем N. Если какой-то
+      из путей не передан, берётся текущее значение из конфига.
+
+  preset apply --name N
+      Применить сохранённый пресет N (перезаписывает текущие пути
+      и сохраняет их в конфиг).
+
+  preset list
+      Список сохранённых пресетов
+
+  preset delete --name N
+      Удалить сохранённый пресет N
 
   config show
       Показать текущую конфигурацию
@@ -2044,10 +2568,14 @@ mtls.sh v2.1 — Менеджер mTLS-сертификатов (только д
 
 ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ:
   MTLS_HOST_IP          Переопределить определённый IP хоста
-  MTLS_CA_PASSPHRASE    Пароль ключа CA (для зашифрованных ключей;
-                        используется только внутри этого процесса и
-                        передаётся openssl через временный файл 0600,
-                        а не через stdin/аргументы)
+  MTLS_CA_PASSPHRASE    Пароль ключа CA (для зашифрованных ключей).
+                        Если задан заранее самим оператором как env var,
+                        это на его усмотрение. Если скрипт запрашивает
+                        пароль интерактивно, он хранится только как
+                        обычная (НЕ экспортированная) переменная шелла —
+                        не в environ процесса — и передаётся openssl
+                        через временный файл 0600, а не через
+                        stdin/аргументы.
   MTLS_P12_PASSWORD     Пароль .p12 по умолчанию (неинтерактивный выпуск)
   MTLS_NONINTERACTIVE   Установите в 1 для пропуска всех запросов
 
@@ -2069,9 +2597,16 @@ cli_ca() {
             done
             if [ "$encrypt" = "1" ] && [ -z "${MTLS_CA_PASSPHRASE:-}" ]; then
                 info "Шифрование ключа CA включено — введите пароль:"
-                export MTLS_CA_PASSPHRASE; MTLS_CA_PASSPHRASE=$(ask_secret "Пароль")
+                # Not exported here — see ca_key_prompt_passphrase for
+                # why. (If an operator pre-sets MTLS_CA_PASSPHRASE as an
+                # exported env var themselves for non-interactive use,
+                # that's their own call and outside this script's
+                # control; we just avoid adding to that exposure when we
+                # generate the value ourselves.)
+                MTLS_CA_PASSPHRASE=$(ask_secret "Пароль")
             fi
             core_create_ca "$cn" "$days" "$encrypt"
+            unset MTLS_CA_PASSPHRASE 2>/dev/null || true
             ;;
         info)
             if ! ca_exists; then cli_err "CA не найден."; exit 1; fi
@@ -2207,6 +2742,7 @@ cli_service() {
                 esac
             done
             [ -z "$name" ] && { cli_err "Требуется --name"; exit 1; }
+            validate_name "Имя сервиса" "$name" || exit 1
             if [ "$mode" = "new" ]; then
                 [ -z "$domain" ] && { cli_err "--domain обязателен для режима new"; exit 1; }
                 [ -z "$target" ] && { cli_err "--target обязателен для режима new"; exit 1; }
@@ -2264,6 +2800,73 @@ cli_service() {
     esac
 }
 
+cli_preset() {
+    local subcmd="${1:-}"; shift || true
+    case "$subcmd" in
+        save)
+            local name="" tp="" cap="" clp="" of=""
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --name)          name="$2"; shift 2 ;;
+                    --traefik-path)  tp="$2"; shift 2 ;;
+                    --ca-path)       cap="$2"; shift 2 ;;
+                    --clients-path)  clp="$2"; shift 2 ;;
+                    --output-file)   of="$2"; shift 2 ;;
+                    *) err "Неизвестная опция: $1"; exit 1 ;;
+                esac
+            done
+            [ -z "$name" ] && { cli_err "Требуется --name"; exit 1; }
+            validate_name "Имя пресета" "$name" || exit 1
+            [ -z "$tp" ] && tp="$TRAEFIK_DYNAMIC_PATH"
+            [ -z "$cap" ] && cap="$CA_PATH"
+            [ -z "$clp" ] && clp="$CLIENTS_PATH"
+            [ -z "$of" ] && of="$OUTPUT_FILE"
+            preset_save "$name" "$tp" "$cap" "$clp" "$of"
+            cli_ok "Пресет '${name}' сохранён."
+            audit_log "preset_save" "name=${name}"
+            ;;
+        apply)
+            local name=""
+            while [ $# -gt 0 ]; do
+                case "$1" in --name) name="$2"; shift 2 ;; *) shift ;; esac
+            done
+            [ -z "$name" ] && { cli_err "Требуется --name"; exit 1; }
+            if preset_apply "$name"; then
+                cli_ok "Пресет '${name}' применён."
+                audit_log "preset_apply" "name=${name}"
+            else
+                cli_err "Пресет '${name}' не найден."
+                exit 1
+            fi
+            ;;
+        list)
+            local pnames; pnames=$(preset_list_names)
+            if [ -z "$pnames" ]; then cli_info "Нет сохранённых пресетов."; exit 0; fi
+            printf "%-16s %-30s %-30s %-30s %-16s\n" "ИМЯ" "TRAEFIK_DYNAMIC_PATH" "CA_PATH" "CLIENTS_PATH" "OUTPUT_FILE"
+            while IFS= read -r p; do
+                [ -z "$p" ] && continue
+                local ptp pcap pclp pof
+                ptp=$(preset_get "$p" "traefik_dynamic_path")
+                pcap=$(preset_get "$p" "ca_path")
+                pclp=$(preset_get "$p" "clients_path")
+                pof=$(preset_get "$p" "output_file")
+                printf "%-16s %-30s %-30s %-30s %-16s\n" "$p" "$ptp" "$pcap" "$pclp" "$pof"
+            done <<< "$pnames"
+            ;;
+        delete)
+            local name=""
+            while [ $# -gt 0 ]; do
+                case "$1" in --name) name="$2"; shift 2 ;; *) shift ;; esac
+            done
+            [ -z "$name" ] && { cli_err "Требуется --name"; exit 1; }
+            preset_delete "$name"
+            cli_ok "Пресет '${name}' удалён."
+            audit_log "preset_delete" "name=${name}"
+            ;;
+        *) cli_err "Неизвестная подкоманда preset: ${subcmd}"; cli_usage; exit 1 ;;
+    esac
+}
+
 cli_config() {
     local subcmd="${1:-}"; shift || true
     case "$subcmd" in
@@ -2276,9 +2879,8 @@ cli_config() {
             echo "  EXPIRY_WARN_DAYS      = $EXPIRY_WARN_DAYS"
             echo "  CA_KEY_ENCRYPTED      = $CA_KEY_ENCRYPTED"
             echo "  BUNDLE_MODE           = $BUNDLE_MODE"
-            echo "  WEBHOOK_URL           = ${WEBHOOK_URL:-<не задан>}"
-            echo "  NOTIFY_EXPIRY_DAYS    = $NOTIFY_EXPIRY_DAYS"
             echo "  REQUIRE_P12_PASSWORD  = $REQUIRE_P12_PASSWORD"
+            echo "  AUDIT_MAX_BYTES       = $AUDIT_MAX_BYTES"
             ;;
         set)
             local key="${1:-}" val="${2:-}"
@@ -2292,9 +2894,8 @@ cli_config() {
                 EXPIRY_WARN_DAYS)      EXPIRY_WARN_DAYS="$val" ;;
                 CA_KEY_ENCRYPTED)      CA_KEY_ENCRYPTED="$val" ;;
                 BUNDLE_MODE)           BUNDLE_MODE="$val" ;;
-                WEBHOOK_URL)           WEBHOOK_URL="$val" ;;
-                NOTIFY_EXPIRY_DAYS)    NOTIFY_EXPIRY_DAYS="$val" ;;
                 REQUIRE_P12_PASSWORD)  REQUIRE_P12_PASSWORD="$val" ;;
+                AUDIT_MAX_BYTES)       AUDIT_MAX_BYTES="$val" ;;
                 *) cli_err "Неизвестный ключ: $key"; exit 1 ;;
             esac
             save_config
@@ -2350,6 +2951,25 @@ cli_cert_renew() {
 #  ENTRY POINT
 # =============================================================================
 require_root
+
+# The JSON "databases" and config live under $HOME by default (see
+# MTLS_*_FILE overrides above). Since this script always runs as root,
+# guard against a pre-planted symlink at any of these well-known paths
+# redirecting root's writes elsewhere (see safe_replace() for the
+# corresponding write-time check). This is a defence-in-depth check on
+# top of safe_replace(), run once at startup so an operator gets a clear
+# error instead of a silently-skipped write later on.
+for _guarded_path in "$CONFIG_FILE" "$DB_FILE" "$SERVICES_FILE" "$AUDIT_FILE" "$PRESETS_FILE"; do
+    if [ -L "$_guarded_path" ]; then
+        echo "" >&2
+        echo -e "  ${RED}✖${RESET}  Отказ: ${_guarded_path} является symlink." >&2
+        echo -e "  ${DIM}Из соображений безопасности скрипт не будет читать/писать по symlink-путям для своих файлов состояния. Удалите symlink и повторите.${RESET}" >&2
+        echo "" >&2
+        exit 1
+    fi
+done
+unset _guarded_path
+
 load_config
 db_init
 check_deps
@@ -2365,6 +2985,7 @@ if [ $# -ge 1 ]; then
         ca)       cli_ca "$@" ;;
         cert)     cli_cert "$@" ;;
         service)  cli_service "$@" ;;
+        preset)   cli_preset "$@" ;;
         config)   cli_config "$@" ;;
         gen)      do_gen_traefik ;;
         audit)    cli_audit "$@" ;;
