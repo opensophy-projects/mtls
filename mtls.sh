@@ -575,7 +575,7 @@ PYEOF
   }
 
   validate_patch_path() {
-  local path="$1" current="$1" parent
+  local path="$1" current="$1"
   [ -n "$path" ] && [ -f "$path" ] && [ ! -L "$path" ] || {
     cli_err "Patch-файл должен быть обычным файлом: $path"; return 1;
   }
@@ -869,7 +869,6 @@ bundle_file() {
 }
 
 rebuild_bundle() {
-    local target_svc="${1:-}"
     local uid="" names; names=$(db_list_names)
     local count=0
 
@@ -2616,7 +2615,7 @@ mtls.sh v2.4 — Менеджер mTLS-сертификатов (только д
 ДОСТУП:
   Скрипт работает только от root. Запускайте через sudo либо напрямую
   под root. Многопользовательского режима больше нет — секретный
-  материал (ключи CA и клиентов) не должен быть доступен кому-либо ещё.
+  материал (к��ючи CA и клиентов) не должен быть доступен кому-либо ещё.
 
 ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ:
   MTLS_HOST_IP          Переопределить определённый IP хоста
