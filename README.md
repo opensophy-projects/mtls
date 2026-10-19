@@ -4,7 +4,6 @@
 
 **CLI/TUI-менеджер mTLS-сертификатов для Traefik — одним Bash-скриптом**
 
-[![CI](https://github.com/opensophy-projects/mtls/actions/workflows/ci.yml/badge.svg)](https://github.com/opensophy-projects/mtls/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 ![Version](https://img.shields.io/badge/version-2.4-blue)
 
